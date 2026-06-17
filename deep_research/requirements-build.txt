@@ -1,0 +1,12 @@
+# 构建与打包所需依赖
+# 用法: pip install -r requirements-build.txt
+
+# 桌面平台（Windows/macOS/Linux）
+pyinstaller>=6.0.0
+
+# Android APK（需要在 Linux 或 macOS 上构建）
+buildozer>=1.5.0
+Cython>=3.0.0
+
+# 额外：检查打包产物
+# linuxdeploy + appimagetool（可选，用于 Linux AppImage）

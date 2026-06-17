@@ -150,3 +150,86 @@ python -m deep_research.cli "研究问题"
 ## License
 
 MIT
+
+---
+
+## 打包成安装包 / 可执行程序
+
+本项目提供一键打包工具，支持：
+
+| 平台 | 产物 | 构建命令 |
+|---|---|---|
+| Windows | `DeepResearch.exe` | `python build.py exe` |
+| macOS | `DeepResearch.app` | `python build.py macos` |
+| Linux | `DeepResearch` (单文件) | `python build.py linux` |
+| Android | `deepresearch-0.1.0-debug.apk` | `python build.py apk` |
+
+### 一、桌面平台（PyInstaller）
+
+```bash
+# 1. 安装打包依赖
+pip install -r requirements-build.txt
+
+# 2. 构建（会自动生成 dist/ 目录）
+python build.py exe       # Windows 出 exe
+python build.py macos     # macOS 出 .app
+python build.py linux     # Linux 出二进制
+
+# 3. 运行
+./dist/DeepResearch      # 会自动启动服务 + 打开浏览器
+```
+
+### 二、Android APK
+
+```bash
+# 需要: JDK 17 + Android SDK + NDK（buildozer 会自动下载）
+# 推荐在 Linux 或 macOS 上构建（Windows 需用 WSL）
+python build.py apk
+
+# 产物：
+#   bin/deepresearch-0.1.0-debug.apk
+#   dist/deepresearch-0.1.0-debug.apk  ← 会自动复制一份
+```
+
+APK 内功能：
+- 启动后在手机本地运行 FastAPI 服务（`http://127.0.0.1:8000`）
+- 自动打开 WebView 访问 UI
+- 内置骁龙 Hexagon NPU 检测，在 Qualcomm 设备上自动启用硬件加速
+- 模型下载到 `/sdcard/Android/data/com.deepresearch.app/`
+
+### 三、Docker
+
+```bash
+docker build -t deep-research .
+docker run -p 8000:8000 deep-research
+```
+
+### 构建文件清单
+
+| 文件 | 用途 |
+|---|---|
+| `build.py` | 主构建辅助脚本（exe/macos/linux/apk 全部一键） |
+| `deep_research.spec` | PyInstaller 打包配置（Windows/macOS/Linux） |
+| `buildozer.spec` | Buildozer 配置（Android APK） |
+| `main.py` | Android 入口（启动 Python 服务 + WebView） |
+| `requirements-build.txt` | 打包工具依赖 |
+
+### 高级：Release 版 APK 签名
+
+编辑 `buildozer.spec` 末尾的签名配置，然后：
+
+```bash
+buildozer android release
+```
+
+### 高级：自定义图标
+
+在项目根目录下创建 `assets/` 目录并放入：
+
+```
+assets/
+  icon.png         # 512x512, 应用图标
+  presplash.png    # 启动画面（1920x1080）
+```
+
+然后取消 `buildozer.spec` 中 `icon.filename` 行的注释。
