@@ -103,12 +103,7 @@ class HardwareProfile:
     npu_arch: str | None = None   # v65 / v66 / v68 / v69 / v73 / v75
 
     def recommend_model(self) -> str:
-        """根据硬件（CPU + 内存 + NPU）推荐最合适的模型 ID。"""
-        if self.has_npu:
-            # 有 NPU → 可以跑更大的量化模型
-            if self.ram_gb >= 10:
-                return "qwen3-7b"       # NPU 加速 7B Q4_K_M
-            return "qwen3-1.7b"          # NPU 加速 1.7B Q4_K_M
+        """根据内存推荐最合适的模型 ID（不考虑加速器，后端由用户自选）。"""
         if self.ram_gb >= 18:
             return "qwen3-14b"
         if self.ram_gb >= 10:
@@ -564,8 +559,78 @@ class LocalLLM:
 
     # ---- 启动 ----
 
-    def start(self, model_id: str, *, n_ctx: int = 8192) -> RunningServer:
+    def _configure_backend_env(self, backend: str, hw: HardwareProfile) -> dict[str, str]:
+        """根据用户选择的推理后端配置环境变量，返回 env dict。"""
+        env = os.environ.copy()
+
+        if backend == "cpu":
+            # 纯 CPU，无任何加速
+            env["GGML_CPU_ONLY"] = "1"
+            env.pop("GGML_VULKAN", None)
+            env.pop("GGML_CUDA", None)
+            env.pop("GGML_METAL", None)
+            env.pop("LLAMA_VULKAN", None)
+
+        elif backend == "gpu":
+            # GPU 加速：按检测到的 GPU 类型选后端
+            if hw.gpu_type == "metal":
+                env["GGML_METAL"] = "1"
+                env["LLAMA_METAL"] = "1"
+            elif hw.gpu_type == "cuda":
+                env["GGML_CUDA"] = "1"
+                env["LLAMA_CUDA"] = "1"
+            elif hw.gpu_type == "adreno":
+                env["GGML_VULKAN"] = "1"
+                env["LLAMA_VULKAN"] = "1"
+            else:
+                # 有 GPU 但类型未知，默认 Vulkan
+                env["GGML_VULKAN"] = "1"
+                env["LLAMA_VULKAN"] = "1"
+
+        elif backend == "npu":
+            # 骁龙 Hexagon NPU（用户明确选择）
+            if hw.has_npu and hw.npu_type == "hexagon_nsp":
+                # 新代 NSP（X Elite / 8 Gen3）
+                env["GGML_VULKAN"] = "1"
+                env["LLAMA_VULKAN"] = "1"
+                env["GGML_NPU"] = "1"
+                env["GGML_HVX"] = "1"
+            elif hw.has_npu and hw.npu_type == "hexagon_hvx":
+                # HVX DSP
+                env["GGML_VULKAN"] = "1"
+                env["GGML_HVX"] = "1"
+            else:
+                # 检测不到 NPU 时给出提示，但仍然尝试 Vulkan
+                env["GGML_VULKAN"] = "1"
+                env["LLAMA_VULKAN"] = "1"
+
+        elif backend == "auto":
+            # 自动选择：GPU > NPU > CPU
+            if hw.gpu_type in ("cuda", "metal"):
+                env["GGML_CUDA"] = "1" if hw.gpu_type == "cuda" else "0"
+                env["GGML_METAL"] = "1" if hw.gpu_type == "metal" else "0"
+            elif hw.has_npu:
+                env["GGML_VULKAN"] = "1"
+                env["GGML_HVX"] = "1"
+            else:
+                env["GGML_CPU_ONLY"] = "1"
+
+        return env
+
+    def start(
+        self,
+        model_id: str,
+        *,
+        n_ctx: int = 8192,
+        backend: str = "auto",
+    ) -> RunningServer:
         """启动 llama_cpp.server，返回可调用的 RunningServer。
+
+        backend（推理后端）: "auto" | "cpu" | "gpu" | "npu"
+          - auto  : GPU > NPU > CPU（根据检测结果自动选择）
+          - cpu   : 纯 CPU 推理，无加速
+          - gpu   : GPU 加速（CUDA / Metal / Vulkan）
+          - npu   : 骁龙 Hexagon NPU 加速
 
         接口：http://localhost:<port>/v1/chat/completions （与 OpenAI 兼容）
         """
@@ -580,11 +645,10 @@ class LocalLLM:
         if self._current_server and self._current_server.is_alive():
             self._current_server.stop()
 
-        # 启动
         hw = detect_hardware()
         n_threads = max(2, hw.cpu_cores - 1 if hw.cpu_cores else 4)
 
-        # llama_cpp.server 的环境变量配置（避免命令行参数复杂）
+        # 基础环境变量
         env = os.environ.copy()
         env["MODEL"] = str(model_path)
         env["N_CTX"] = str(n_ctx)
@@ -594,16 +658,10 @@ class LocalLLM:
         env["CHAT_FORMAT"] = MODEL_CATALOG[model_id]["chat_template"]
         env["VERBOSE"] = "false"
 
-        # ---- 骁龙 Hexagon NPU 推理配置 ----
-        if hw.has_npu and hw.npu_type:
-            if hw.npu_type == "hexagon_nsp":
-                # 新代 NSP（X Elite / 8 Gen3）：用 Vulkan 加速
-                env["LLAMA_VULKAN"] = "1"
-                env["GGML_VULKAN"] = "1"
-                env["GGML_NPU"] = "1"
-            elif hw.npu_type == "hexagon_hvx":
-                # HVX DSP：配置 Vulkan 作为 fallback
-                env["GGML_VULKAN"] = "1"
+        # 应用用户选择的后端
+        env = self._configure_backend_env(backend, hw)
+        # 同时设置 LLAMA_SERVER_BACKEND 方便 llama_cpp.server 读取
+        env["LLAMA_SERVER_BACKEND"] = backend
 
         cmd = [sys.executable, "-m", "llama_cpp.server"]
         proc = subprocess.Popen(
@@ -625,6 +683,7 @@ class LocalLLM:
         # ⭐ 关键：把本地服务 URL 写入环境变量，LLMClient 会自动切换到本地
         os.environ["LOCAL_LLM_BASE_URL"] = server.model_endpoint
         os.environ["LOCAL_LLM_NAME"] = server.model_name
+        os.environ["LOCAL_LLM_BACKEND"] = backend  # 记录当前后端
 
         return server
 

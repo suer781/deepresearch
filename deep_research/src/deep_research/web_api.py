@@ -282,8 +282,22 @@ async def start_model_download(model_id: str):
 
 
 @app.post("/models/start/{model_id}")
-async def start_model_server(model_id: str):
-    """启动本地 LLM 服务（llama_cpp.server + OpenAI 兼容）。"""
+async def start_model_server(
+    model_id: str,
+    backend: str = "auto",
+):
+    """启动本地 LLM 服务（llama_cpp.server + OpenAI 兼容）。
+
+    backend（推理后端）:
+      - auto : 自动选择（GPU > NPU > CPU）
+      - cpu  : 纯 CPU 推理
+      - gpu  : GPU 加速（CUDA / Metal / Vulkan）
+      - npu  : 骁龙 Hexagon NPU 加速
+    """
+    VALID_BACKENDS = {"auto", "cpu", "gpu", "npu"}
+    if backend not in VALID_BACKENDS:
+        raise HTTPException(400, f"Invalid backend. Must be one of: {VALID_BACKENDS}")
+
     if model_id not in MODEL_CATALOG:
         raise HTTPException(404, "Unknown model")
 
@@ -292,7 +306,7 @@ async def start_model_server(model_id: str):
         raise HTTPException(400, "Model not downloaded. Call POST /models/download/{model_id} first.")
 
     try:
-        server = llm_manager.start(model_id)
+        server = llm_manager.start(model_id, backend=backend)
     except Exception as e:
         raise HTTPException(500, f"Failed to start: {e}")
 
@@ -305,6 +319,7 @@ async def start_model_server(model_id: str):
         "status": "started",
         "model_id": model_id,
         "model_name": server.model_name,
+        "backend": backend,
         "base_url": server.model_endpoint,
         "chat_endpoint": f"{server.model_endpoint}/chat/completions",
     }

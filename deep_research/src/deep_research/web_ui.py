@@ -499,6 +499,41 @@ INDEX_HTML = r"""<!DOCTYPE html>
   details[open] summary::before { transform: rotate(90deg); }
   details .content { margin-top: 10px; color: var(--text-dim); font-size: 0.85rem; }
   details .content b { color: var(--text); }
+
+  /* 推理后端选择器 */
+  .backend-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .backend-label {
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+  .be-label {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all 0.15s;
+    user-select: none;
+  }
+  .be-label:hover { border-color: var(--accent-2); color: var(--text); }
+  .be-label.active {
+    background: rgba(99, 102, 241, 0.18);
+    border-color: var(--accent);
+    color: var(--accent-2);
+  }
+  .be-label.active:hover { border-color: var(--accent-2); }
 </style>
 </head>
 <body>
@@ -696,6 +731,9 @@ function renderModels(data) {
     ? `<div style="font-size:0.72rem; color:var(--accent-2); margin-top:4px;">⚡ NPU 加速可用 · ${npuBrand}${npuTops ? " · " + npuTops : ""}</div>`
     : "";
 
+  // 存储用户当前选择的推理后端（模型ID → 后端）
+  if (!window._modelBackends) window._modelBackends = {};
+
   list.innerHTML = models.map(m => {
     const downloaded = m.downloaded;
     const sizeMB = Math.round((m.size_bytes || 0) / 1024 / 1024);
@@ -706,6 +744,21 @@ function renderModels(data) {
     } else {
       statusBadge = `<span class="badge notready">未下载</span>`;
     }
+
+    // 推理后端选择（4选1）
+    const backends = [
+      { value: "auto", label: "自动" },
+      { value: "cpu",  label: "CPU" },
+      { value: "gpu",  label: "GPU" },
+      { value: "npu",  label: "NPU" },
+    ];
+    const savedBackend = window._modelBackends[m.id] || "auto";
+    const backendRadios = backends.map(b =>
+      `<label class="be-label${savedBackend === b.value ? ' active' : ''}" title="${b.label}"
+                onclick="window._modelBackends['${m.id}']='${b.value}'; this.parentElement.querySelectorAll('.be-label').forEach(l=>l.classList.remove('active')); this.classList.add('active')">
+         <span>${b.label}</span>
+       </label>`
+    ).join("");
 
     let actionBtn;
     if (downloaded) {
@@ -726,6 +779,10 @@ function renderModels(data) {
             <span class="size-pill">${sizeMB} MB</span>
             ${statusBadge}
           </div>
+        </div>
+        <div class="backend-row">
+          <span class="backend-label">推理后端：</span>
+          ${backendRadios}
         </div>
         <div id="progress-${m.id}"></div>
         <div class="btn-row">${actionBtn}</div>
@@ -799,22 +856,27 @@ async function downloadModel(modelId) {
 async function startModel(modelId) {
   const card = document.querySelector(`.model-card[data-id="${modelId}"]`);
   if (card) card.classList.add("active");
-  toast(`启动 ${modelId} 服务...`);
+  const backend = window._modelBackends[modelId] || "auto";
+  const backendLabel = { auto: "自动", cpu: "CPU", gpu: "GPU", npu: "NPU" }[backend] || backend;
+  toast(`启动 ${modelId} (${backendLabel})...`);
 
   try {
-    const resp = await fetch(`/models/start/${modelId}`, { method: "POST" }).then(r => {
+    const resp = await fetch(`/models/start/${modelId}?backend=${backend}`, { method: "POST" }).then(r => {
       if (!r.ok) return r.json().then(j => Promise.reject(j.detail || "启动失败"));
       return r.json();
     });
     runningModelServer = resp;
     document.getElementById("running-card").style.display = "block";
+    const respBackend = resp.backend || backend;
+    const respBackendLabel = { auto: "自动", cpu: "CPU", gpu: "GPU", npu: "NPU" }[respBackend] || respBackend;
     document.getElementById("running-info").innerHTML =
       `✅ <b>${resp.model_name}</b> 已启动<br>` +
       `<code style="color:var(--accent-2)">${resp.base_url}</code><br>` +
-      `OpenAI 兼容接口 · 可直接使用研究功能`;
-    document.getElementById("research-mode-tag").textContent = "本地模式 · 就绪";
-    document.getElementById("next-step").innerHTML = "✅ 模型已启动，点击上方 <b>Research</b> 开始研究。";
-    toast("模型已就绪！", "success");
+      `推理后端: <b>${respBackendLabel}</b> · OpenAI 兼容接口`;
+    document.getElementById("research-mode-tag").textContent = `本地 · ${respBackendLabel} · 就绪`;
+    document.getElementById("next-step").innerHTML =
+      `✅ 模型已启动（<b>${respBackendLabel}</b>），点击上方 <b>Research</b> 开始研究。`;
+    toast(`模型已就绪！ (${respBackendLabel})`, "success");
   } catch (err) {
     toast(String(err), "error");
   } finally {
