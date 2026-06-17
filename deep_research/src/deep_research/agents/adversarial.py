@@ -36,9 +36,10 @@ class AdversarialAgent(BaseAgent):
     role = AgentRole.ADVERSARIAL
     system_prompt = ADVERSARIAL_SYSTEM
 
-    def __init__(self, evidence_store: EvidenceStore) -> None:
+    def __init__(self, evidence_store: EvidenceStore, local_mode: bool = False) -> None:
         super().__init__()
         self.store = evidence_store
+        self.local_mode = local_mode
 
     async def run(self, mainstream_claim: str) -> list[Evidence]:
         """针对主流论点，搜索反例。"""

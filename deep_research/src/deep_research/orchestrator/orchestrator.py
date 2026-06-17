@@ -47,14 +47,17 @@ console = Console()
 class Orchestrator:
     """主调度器。"""
 
-    def __init__(self) -> None:
+    def __init__(self, local_mode: bool | None = None) -> None:
         self.settings = get_settings()
+        self.local_mode = local_mode if local_mode is not None else self.settings.use_local_model
+        if self.local_mode:
+            self.settings.use_local_model = True
         self.store = EvidenceStore()
         self.clarifier = ClarifierAgent()
-        self.planner = PlannerAgent()
-        self.searcher = SearcherAgent(self.store)
+        self.planner = PlannerAgent(local_mode=self.local_mode)
+        self.searcher = SearcherAgent(self.store, local_mode=self.local_mode)
         self.verifier = VerifierAgent(self.store)
-        self.adversarial = AdversarialAgent(self.store)
+        self.adversarial = AdversarialAgent(self.store, local_mode=self.local_mode)
         self.synthesizer = SynthesizerAgent(self.store)
         self.reviewer = ReviewerAgent()
         self.timeline = Timeline()
@@ -165,7 +168,13 @@ class Orchestrator:
 
     async def run(self, question: Question) -> Report:
         """执行完整研究流程。"""
-        console.print(f"\n[bold]📚 Deep Research: {question.text}[/bold]\n")
+        console.print(f"\n[bold]📚 Deep Research: {question.text}[/bold]")
+        if self.local_mode:
+            from ..llm import get_llm
+            llm = get_llm()
+            console.print(f"[dim]🏠 本地模式: model={llm.primary or 'local'}, endpoint={llm.base_url}, 仅免 key 搜索源[/dim]")
+        else:
+            console.print("[dim]☁️ 云端模式[/dim]")
 
         with Progress(
             SpinnerColumn(),

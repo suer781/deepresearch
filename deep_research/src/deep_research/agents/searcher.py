@@ -37,16 +37,22 @@ class SearcherAgent(BaseAgent):
     role = AgentRole.SEARCHER
     system_prompt = SEARCHER_SYSTEM
 
-    def __init__(self, evidence_store: EvidenceStore) -> None:
+    def __init__(self, evidence_store: EvidenceStore, local_mode: bool = False) -> None:
         super().__init__()
         self.store = evidence_store
+        self.local_mode = local_mode
 
     async def run(self, task: SubTask) -> list[Evidence]:
         """执行子任务，搜索并保存证据。"""
         # 步骤 1: 让 LLM 构造查询和提取策略
+        from ..sources import filter_to_local, get_default_sources
+        preferred = filter_to_local(task.preferred_sources) if self.local_mode else task.preferred_sources
+        if not preferred:
+            preferred = get_default_sources(local_mode=self.local_mode)[:3]
+
         plan = await self.think_json(
             f"子问题：{task.question}\n"
-            f"可用搜索源：{task.preferred_sources}\n\n"
+            f"可用搜索源（优先顺序）：{preferred}\n\n"
             f"请规划如何搜索这个子问题。"
         )
         queries = plan.get("queries_used", [task.question])
@@ -54,7 +60,7 @@ class SearcherAgent(BaseAgent):
         # 步骤 2: 调用搜索源（异步并行）
         import asyncio
         results_per_query: list[list[dict]] = await asyncio.gather(
-            *[_search_with_sources(q, task.preferred_sources) for q in queries]
+            *[_search_with_sources(q, preferred) for q in queries]
         )
 
         # 步骤 3: 让 LLM 从原始结果中筛选证据

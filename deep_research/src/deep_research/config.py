@@ -16,13 +16,20 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # LLM
+    # LLM - 云端
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     anthropic_api_key: str = ""
     primary_model: str = "gpt-4o"
     debater_model: str = "gpt-4o-mini"
     critic_model: str = "gpt-4o-mini"
+
+    # LLM - 本地（Ollama / LM Studio / vLLM 等 OpenAI 兼容服务）
+    use_local_model: bool = False
+    # Ollama 默认 http://localhost:11434/v1 ；LM Studio 默认 http://localhost:1234/v1
+    local_model_url: str = "http://localhost:11434/v1"
+    local_model_name: str = "qwen3:8b"
+    local_model_ctx: int = 8192
 
     # 搜索 API
     tavily_api_key: str = ""

@@ -16,10 +16,12 @@ from .types import Question
 @click.option("--locale", default="zh-CN", help="zh-CN / en-US")
 @click.option("--max-parallel", default=8, type=int)
 @click.option("--output", "-o", default=None, help="输出 Markdown 报告路径")
-def main(question: str, depth: str, locale: str, max_parallel: int, output: str | None) -> None:
+@click.option("--local", "local_mode", is_flag=True, default=None,
+              help="本地部署模式：使用本地 LLM（Ollama / LM Studio 等）+ 免 key 搜索源")
+def main(question: str, depth: str, locale: str, max_parallel: int, output: str | None, local_mode: bool | None) -> None:
     """Deep Research - 超级并行多智能体深度研究系统。"""
     q = Question(text=question, locale=locale, depth_hint=depth)
-    orch = Orchestrator()
+    orch = Orchestrator(local_mode=local_mode)
 
     if max_parallel:
         from .config import get_settings
