@@ -151,6 +151,40 @@ class HardwareProfile:
             return "qwen3-1.7b"
         return "smollm-1.7b"
 
+    def recommend_deployment_mode(self) -> str:
+        """根据机器算力自动推荐部署模式：'api' 或 'local'。
+
+        推荐本地部署的条件（需同时满足）：
+          1. 有 GPU 或 NPU（TOPS >= 3）
+          2. 内存 >= 4 GB
+        否则推荐 API 模式（无需下载模型，速度更快）。
+
+        规则说明：
+          - 手机 / 低配机器：API 优先（省电省内存）
+          - 有 NPU/GPU + 内存 >= 4GB：本地部署（保护隐私 + 离线可用）
+          - 纯 CPU + 内存 < 8GB：强烈推荐 API（本地推理极慢）
+          - 服务器 / 台式机 + 强加速器：本地部署（可跑更大模型）
+        """
+        # 基础门槛：内存不足 4GB → 不适合本地
+        if self.ram_gb < 4:
+            return "api"
+
+        # 有加速器（GPU 或 NPU）且 TOPS >= 3 → 本地优先
+        best_acc = self.accelerators[0] if self.accelerators else None
+        if best_acc and (best_acc.tops or 0) >= 3:
+            return "local"
+
+        # 无加速器：纯 CPU 推理
+        if not best_acc:
+            # 内存 >= 8GB 且核心 >= 4 → 本地勉强可用（但很慢）
+            if self.ram_gb >= 8 and self.cpu_cores >= 4:
+                return "local"
+            # 否则 → API
+            return "api"
+
+        # 有加速器但 TOPS < 3 → 降级到 API
+        return "api"
+
     def best_accelerator_for_backend(self, backend: str) -> Accelerator | None:
         """按后端名查找最合适的加速器。"""
         for a in self.accelerators:
@@ -1106,11 +1140,11 @@ def status_json(local_llm: LocalLLM | None, hw: HardwareProfile | None = None) -
             "has_gpu": hw.has_gpu,
             "has_npu": hw.has_npu,
             "gpu_names": hw.gpu_names,
-            # 检测到的所有加速器（用于 UI 动态显示后端选择）
             "accelerators": accel_dicts,
-            # 检测到的唯一后端 subtype 列表
             "detected_backends": hw.detected_backends(),
             "recommended_model": hw.recommend_model(),
+            # ---- 新增：推荐部署模式 ----
+            "recommended_deployment_mode": hw.recommend_deployment_mode(),
         },
         "models": local_llm.list_models() if local_llm else [],
         "server": {

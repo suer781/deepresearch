@@ -534,6 +534,30 @@ INDEX_HTML = r"""<!DOCTYPE html>
     color: var(--accent-2);
   }
   .be-label.active:hover { border-color: var(--accent-2); }
+
+  /* 部署模式推荐 Banner */
+  .mode-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    border-radius: var(--radius);
+    margin-bottom: 12px;
+    cursor: default;
+  }
+  .mode-local {
+    background: linear-gradient(135deg, rgba(34, 197, 94, 0.12) 0%, rgba(16, 185, 129, 0.08) 100%);
+    border: 1px solid rgba(34, 197, 94, 0.3);
+    color: #4ade80;
+  }
+  .mode-api {
+    background: linear-gradient(135deg, rgba(59, 130, 246, 0.12) 0%, rgba(99, 102, 241, 0.08) 100%);
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    color: #60a5fa;
+  }
+  .mode-icon { font-size: 1.6rem; line-height: 1; }
+  .mode-title { font-weight: 700; font-size: 0.9rem; }
+  .mode-desc { font-size: 0.75rem; opacity: 0.8; margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -545,6 +569,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
 <!-- Setup 面板 -->
 <section class="panel active" id="panel-setup">
+
+  <!-- 模式推荐 Banner（JS 动态填充） -->
+  <div id="mode-recommendation" style="display:none"></div>
 
   <div class="card">
     <h2>🖥️ 环境检测 <span class="tag" id="env-loading">加载中...</span></h2>
@@ -672,23 +699,77 @@ async function loadEnv() {
   try {
     const data = await fetch("/status").then(r => r.json());
     const grid = document.getElementById("env-grid");
+
+    // ---- 醒目模式推荐 Banner ----
+    const mode = data.hardware?.recommended_deployment_mode || "api";
+    const modeCard = document.getElementById("mode-recommendation");
+    if (modeCard) {
+      if (mode === "local") {
+        const accels = (data.hardware && data.hardware.accelerators) || [];
+        const bestAcc = accels[0];
+        const accelDesc = bestAcc
+          ? `${bestAcc.name} · ${bestAcc.tops ? bestAcc.tops + " TOPS" : ""}`
+          : "";
+        modeCard.innerHTML = `
+          <div class="mode-banner mode-local">
+            <div class="mode-icon">🏠</div>
+            <div class="mode-text">
+              <div class="mode-title">推荐：本地部署</div>
+              <div class="mode-desc">检测到加速器 ${accelDesc}，适合本地推理（保护隐私 + 离线可用）</div>
+            </div>
+          </div>`;
+        modeCard.style.display = "";
+      } else {
+        const accels = (data.hardware && data.hardware.accelerators) || [];
+        const accelDesc = accels.length
+          ? `（检测到 ${accels.map(a => a.name).join(", ")}）`
+          : "";
+        const reason = accels.length === 0 && (data.hardware?.ram_gb || 0) < 8
+          ? "无加速器，内存 < 8GB"
+          : accels.length === 0
+            ? "无 GPU/NPU 加速"
+            : accels[0] && (accels[0].tops || 0) < 3
+              ? "加速器算力不足"
+              : "内存不足";
+        modeCard.innerHTML = `
+          <div class="mode-banner mode-api">
+            <div class="mode-icon">☁️</div>
+            <div class="mode-text">
+              <div class="mode-title">推荐：API 模式</div>
+              <div class="mode-desc">${reason} ${accelDesc}，API 模式速度更快且无需下载模型</div>
+            </div>
+          </div>`;
+        modeCard.style.display = "";
+      }
+    }
+
+    // ---- 硬件信息格 ----
     const items = [
-      { label: "CPU Cores", value: data.hardware?.cpu_count || "?" },
-      { label: "RAM", value: data.hardware?.ram_gb ? data.hardware.ram_gb + " GB" : "?" },
-      { label: "GPU", value: data.hardware?.has_gpu ? "✓ " + (data.hardware.gpu_names?.[0] || data.hardware.gpu_type || "") : "—" },
-      { label: "平台", value: data.hardware?.platform || (data.hardware?.system + " " + (data.hardware?.machine || "")) },
-      { label: "本地 LLM", value: data.local_llm_running ? "✓ 运行中" : "未启动" },
-      { label: "可用模型", value: (data.models_available || []).length },
+      { label: "平台", value: (data.hardware?.system || "") + " " + (data.hardware?.machine || "") },
+      { label: "CPU 核心", value: data.hardware?.cpu_cores || "?" },
+      { label: "内存", value: data.hardware?.ram_gb ? data.hardware.ram_gb + " GB" : "?" },
+      { label: "GPU", value: data.hardware?.has_gpu ? "✓ " + (data.hardware.gpu_names?.[0] || "") : "—" },
     ];
-    // 骁龙 NPU 扩展显示
-    if (data.hardware?.has_npu) {
+
+    // 动态显示所有检测到的加速器（NPU 行）
+    const accels = (data.hardware && data.hardware.accelerators) || [];
+    const npuAccels = accels.filter(a => a.kind === "npu");
+    for (const a of npuAccels) {
       items.push({
-        label: "骁龙 NPU",
-        value: (data.hardware.npu_brand || data.hardware.npu_type || "?") +
-               " · " + (data.hardware.npu_tops ? data.hardware.npu_tops + " TOPS" : "") +
-               " · Hexagon " + (data.hardware.npu_arch || "?")
+        label: a.brand + " NPU",
+        value: a.name + (a.tops ? " · " + a.tops + " TOPS" : ""),
       });
     }
+
+    // 当前本地 LLM 状态
+    const localRunning = data.local_llm_running;
+    const serverRunning = data.server && data.server.running;
+    const isLocalActive = localRunning || serverRunning;
+    items.push({
+      label: "当前模式",
+      value: isLocalActive ? "🏠 本地运行中" : "☁️ API 模式",
+    });
+
     grid.innerHTML = items.map(i =>
       `<div class="env-item"><div class="label">${i.label}</div><div class="value">${i.value}</div></div>`
     ).join("");
