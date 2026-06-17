@@ -59,46 +59,42 @@ C 类 - 付费 API 兜底：
 
 ## 快速开始
 
-### 方式 A —— 本地部署（推荐：完全免 key，隐私友好）
-
-只需两样：一个本地跑的 OpenAI 兼容 LLM + 浏览器抓取。
+### ⭐ 最简单 —— 一键 Web UI（下载就能用，不需要懂命令行）
 
 ```bash
-# 1. 安装 Ollama（或 LM Studio / vLLM 等）
-#    下载: https://ollama.com
-ollama pull qwen3:8b        # 中文效果好，8B 就能跑
-ollama serve                # 默认端口 11434
-
-# 2. 安装项目依赖
-pip install -e ".[dev]"
-playwright install chromium
-
-# 3. 直接跑（--local 自动切换到本地 LLM + 免 key 搜索源）
-PYTHONPATH=src python -m deep_research.cli --local "深度研究：qwen3 与 llama3.3 在中文 RAG 场景的对比"
+# 下载项目后，一行命令启动：
+python run.py
 ```
 
-支持的本地 LLM（走 OpenAI 兼容协议）：
-- **Ollama** — `http://localhost:11434/v1`
-- **LM Studio** — `http://localhost:1234/v1`（开启 "Allow CORS"）
-- **vLLM** — `http://localhost:8000/v1`
-- **llama.cpp server** — `http://localhost:8080/v1`
-- 任何实现了 `/chat/completions` 的服务
+自动完成：检测依赖 → 启动服务 → 打开浏览器（http://localhost:8765）
 
-本地模式下，搜索源会自动限制为免 API key 的：
-`duckduckgo, bing_cn_scrape, bing_scrape, web_scrape, wikipedia, arxiv, semantic_scholar, hackernews, reddit, github`
+**需要提前安装 Ollama**（如果只用本地模式）：
+```bash
+# 下载: https://ollama.com
+ollama pull qwen3:8b
+ollama serve
+```
 
-### 方式 B —— 云端部署
+支持 Docker：
+```bash
+docker build -t deep-research .
+docker run -p 8765:8765 deep-research
+```
+
+---
+
+### 方式 B —— 命令行
 
 ```bash
-cp config/.env.example config/.env
-# 填入 OPENAI_API_KEY 和可选的 TAVILY_API_KEY 等
-
-pip install -e .
+# 安装
+pip install -e ".[web]"
 playwright install chromium
 
-python -m deep_research.cli "你的研究问题"
-# 或生成 Markdown 报告
-python -m deep_research.cli -o report.md "你的研究问题"
+# 本地模式（需要 Ollama）
+python -m deep_research.cli --local "研究问题"
+
+# 云端模式（需要 OpenAI key）
+python -m deep_research.cli "研究问题"
 ```
 
 ## 架构说明
