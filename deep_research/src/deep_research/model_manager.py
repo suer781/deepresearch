@@ -89,14 +89,26 @@ DOWNLOAD_MIRRORS: list[str] = [
 @dataclass
 class HardwareProfile:
     system: str
-    machine: str  # x86_64 / arm64
+    machine: str  # x86_64 / arm64 / aarch64
     cpu_cores: int
     ram_gb: float
     has_gpu: bool = False
-    gpu_type: str | None = None  # cuda / metal / vulkan
+    gpu_type: str | None = None  # cuda / metal / adreno / vulkan
+    gpu_names: list[str] = field(default_factory=list)
+    # ---- 骁龙 NPU ----
+    has_npu: bool = False
+    npu_type: str | None = None   # hexagon_hvx / hexagon_nsp / hexagon_pronto / qnn
+    npu_brand: str | None = None  # Snapdragon X Elite / Snapdragon 8 Gen 3 / ...
+    npu_tops: float | None = None  # NPU TOPS（估算）
+    npu_arch: str | None = None   # v65 / v66 / v68 / v69 / v73 / v75
 
     def recommend_model(self) -> str:
-        """根据硬件推荐最合适的模型 ID。"""
+        """根据硬件（CPU + 内存 + NPU）推荐最合适的模型 ID。"""
+        if self.has_npu:
+            # 有 NPU → 可以跑更大的量化模型
+            if self.ram_gb >= 10:
+                return "qwen3-7b"       # NPU 加速 7B Q4_K_M
+            return "qwen3-1.7b"          # NPU 加速 1.7B Q4_K_M
         if self.ram_gb >= 18:
             return "qwen3-14b"
         if self.ram_gb >= 10:
@@ -106,8 +118,126 @@ class HardwareProfile:
         return "smollm-1.7b"
 
 
+# ---- 骁龙 NPU 检测 ----
+
+def _detect_snapdragon_npu() -> tuple[bool, str | None, str | None, float | None, str | None]:
+    """检测 Snapdragon NPU（Hexagon DSP / Hexagon NPU）。
+
+    检测路径：
+      - Android/Linux: /proc/cpuinfo 中的 Qualcomm / Kryo 签名
+      - /dev/hvx （Hexagon Vector eXtension 协处理器）
+      - /sys/devices/soc0/ 路径（Android SoC 信息）
+    返回：(has_npu, npu_type, npu_brand, npu_tops, npu_arch)
+    """
+    import re
+
+    npu_type: str | None = None
+    npu_brand: str | None = None
+    npu_tops: float | None = None
+    npu_arch: str | None = None
+
+    # ---- 1. 读 /proc/cpuinfo ----
+    cpuinfo = ""
+    try:
+        with open("/proc/cpuinfo") as f:
+            cpuinfo = f.read()
+    except Exception:
+        pass
+
+    # Qualcomm Snapdragon 签名检测
+    is_qualcomm = bool(
+        re.search(r"Hardware\s*[:=]\s*.*[Qq]ualcomm", cpuinfo) or
+        re.search(r"model name\s*[:=]\s*Kryo", cpuinfo) or
+        re.search(r"CPU architecture.*AArch64.*Qualcomm", cpuinfo)
+    )
+
+    # 提取 Snapdragon 型号
+    for pattern in [
+        r"(Snapdragon\s+X\s*Elite)",
+        r"(Snapdragon\s+X\s*Plus)",
+        r"(Snapdragon\s+8\s*Gen\s*\d)",
+        r"(Snapdragon\s+7[^\s,\n]*\s*Gen\s*\d?)",
+        r"(Snapdragon\s+6[^\s,\n]*\s*Gen\s*\d?)",
+        r"(Snapdragon\s+865)",
+        r"(Snapdragon\s+855)",
+        r"(Snapdragon\s+8cx)",
+    ]:
+        m = re.search(pattern, cpuinfo, re.IGNORECASE)
+        if m:
+            npu_brand = m.group(1).strip()
+            break
+
+    if not is_qualcomm and not npu_brand:
+        return False, None, None, None, None
+
+    # ---- 2. 检测 Hexagon HVX 协处理器 ----
+    has_hvx = False
+    try:
+        import os as _os
+        has_hvx = (
+            _os.path.exists("/dev/hvx") or
+            _os.path.exists("/dev/qvr-hvx") or
+            _os.path.exists("/dev/adsprpc") or
+            bool(_os.listdir("/dev/"))
+        )
+    except Exception:
+        pass
+
+    # ---- 3. 读 /sys/devices/soc0/ (Android) ----
+    soc_family = ""
+    try:
+        soc_paths = ["/sys/devices/soc0/", "/sys/firmware/devicetree/base/"]
+        for sp in soc_paths:
+            for fname in ["family", "machine", "soc_id"]:
+                for attempt in [f"{sp}{fname}", f"{sp}@{fname}"]:
+                    try:
+                        val = open(attempt).read().strip()[:64]
+                        if val and ("qcom" in val.lower() or "qualcomm" in val.lower()):
+                            soc_family = val
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # ---- 4. 根据芯片代数推断 NPU 能力 ----
+    # Snapdragon NPU (Hexagon) 代数 → 估算 TOPS
+    SNAPDragon_NPU_TABLE = [
+        ("Snapdragon X Elite",      "hexagon_nsp", "v75", 45.0),
+        ("Snapdragon X Plus",       "hexagon_nsp", "v75", 38.0),
+        ("Snapdragon 8 Gen 3",      "hexagon_nsp", "v73", 33.0),
+        ("Snapdragon 8 Gen 2",      "hexagon_nsp", "v69", 27.0),
+        ("Snapdragon 8 Gen 1",      "hexagon_nsp", "v68", 18.0),
+        ("Snapdragon 7[^,\n]*Gen",  "hexagon_nsp", "v66", 10.0),
+        ("Snapdragon 6[^,\n]*Gen",  "hexagon_hvx", "v65",  4.0),
+        ("Snapdragon 865",          "hexagon_hvx", "v62",  5.0),
+        ("Snapdragon 855",          "hexagon_hvx", "v60",  4.0),
+        ("Snapdragon 8cx",          "hexagon_hvx", "v60",  5.0),
+    ]
+
+    if npu_brand:
+        for pattern, ntype, arch, tops in SNAPDragon_NPU_TABLE:
+            if re.search(pattern, npu_brand, re.IGNORECASE):
+                npu_type = ntype
+                npu_arch = arch
+                npu_tops = tops
+                break
+
+    if npu_type is None:
+        # 已检测到 Qualcomm 但没匹配具体型号
+        if has_hvx or soc_family:
+            npu_type = "hexagon_hvx"
+            npu_arch = "v60"
+            npu_tops = 3.5
+        else:
+            npu_type = "hexagon_hvx"
+            npu_arch = "v50"
+            npu_tops = 2.0
+
+    return True, npu_type, npu_brand, npu_tops, npu_arch
+
+
 def detect_hardware() -> HardwareProfile:
-    """检测 CPU/内存/GPU。"""
+    """检测 CPU / 内存 / GPU / 骁龙 NPU。"""
     system = platform.system()
     machine = platform.machine()
     cores = os.cpu_count() or 4
@@ -137,17 +267,55 @@ def detect_hardware() -> HardwareProfile:
 
     # GPU 检测
     gpu = False
-    gpu_type = None
+    gpu_type: str | None = None
+    gpu_names: list[str] = []
     if system == "Darwin":
-        gpu = True  # macOS 金属加速器默认可用
+        gpu = True
         gpu_type = "metal"
     else:
+        # NVIDIA CUDA
         try:
-            subprocess.run(["nvidia-smi"], capture_output=True, timeout=5, check=False)
-            gpu = True
-            gpu_type = "cuda"
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, timeout=8, check=False,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                gpu = True
+                gpu_type = "cuda"
+                gpu_names = [n.strip() for n in r.stdout.strip().splitlines() if n.strip()]
         except Exception:
             pass
+
+        # Qualcomm Adreno GPU（Android / 骁龙设备）
+        if not gpu:
+            try:
+                import glob as _glob
+                # /sys/class/drm/card*/device/name
+                for pattern in ["/sys/class/drm/card*/device/name"]:
+                    for d in _glob.glob(pattern):
+                        try:
+                            name = open(d).read().strip()
+                            if "adreno" in name.lower() or "qualcomm" in name.lower():
+                                gpu = True
+                                gpu_type = "adreno"
+                                gpu_names.append(name)
+                        except Exception:
+                            pass
+                # /sys/class/graphics/fb0/name (framebuffer)
+                for fb in _glob.glob("/sys/class/graphics/fb*/name"):
+                    try:
+                        name = open(fb).read().strip()
+                        if "adreno" in name.lower():
+                            gpu = True
+                            gpu_type = "adreno"
+                            gpu_names.append(name)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    # 骁龙 NPU 检测
+    has_npu, npu_type, npu_brand, npu_tops, npu_arch = _detect_snapdragon_npu()
 
     return HardwareProfile(
         system=system,
@@ -156,6 +324,12 @@ def detect_hardware() -> HardwareProfile:
         ram_gb=round(ram_gb, 1),
         has_gpu=gpu,
         gpu_type=gpu_type,
+        gpu_names=gpu_names,
+        has_npu=has_npu,
+        npu_type=npu_type,
+        npu_brand=npu_brand,
+        npu_tops=npu_tops,
+        npu_arch=npu_arch,
     )
 
 
@@ -331,13 +505,36 @@ class LocalLLM:
 
         # 自动安装
         cmd = [sys.executable, "-m", "pip", "install", "llama-cpp-python"]
-        # 如有 GPU，额外加标志
+        # 如有加速器，额外加 CMAKE 标志
         hw = detect_hardware()
         env = os.environ.copy()
+        cmake_args: list[str] = []
+
         if hw.gpu_type == "metal":
-            env["CMAKE_ARGS"] = "-DLLAMA_METAL=on"
+            cmake_args.append("-DLLAMA_METAL=on")
         elif hw.gpu_type == "cuda":
-            env["CMAKE_ARGS"] = "-DLLAMA_CUBLAS=on"
+            cmake_args.append("-DLLAMA_CUBLAS=on")
+        elif hw.gpu_type == "adreno":
+            cmake_args.append("-DLLAMA_VULKAN=on")
+        # ---- 骁龙 Hexagon NPU ----
+        elif hw.has_npu and hw.npu_type:
+            if hw.npu_type == "hexagon_nsp":
+                # 新代 Hexagon NSP（X Elite / 8 Gen3）：用 Vulkan + Hexagon 后端
+                cmake_args.append("-DLLAMA_VULKAN=on")
+                cmake_args.append("-DLLAMA_HIPBLAS=on")
+                cmake_args.append(f"-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc")
+                cmake_args.append(f"-DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++")
+            elif hw.npu_type == "hexagon_hvx":
+                # HVX DSP：尽量用 HIP 或 Vulkan
+                cmake_args.append("-DLLAMA_VULKAN=on")
+
+        if cmake_args:
+            env["CMAKE_ARGS"] = " ".join(cmake_args)
+            # 告诉 llama.cpp server 用哪种后端
+            if hw.has_npu and hw.npu_type == "hexagon_nsp":
+                env["LLAMA_BACKEND"] = "vulkan"
+            elif hw.has_npu and hw.npu_type == "hexagon_hvx":
+                env["LLAMA_BACKEND"] = "vulkan"
 
         try:
             subprocess.run(cmd, check=True, env=env, capture_output=False)
@@ -397,6 +594,17 @@ class LocalLLM:
         env["CHAT_FORMAT"] = MODEL_CATALOG[model_id]["chat_template"]
         env["VERBOSE"] = "false"
 
+        # ---- 骁龙 Hexagon NPU 推理配置 ----
+        if hw.has_npu and hw.npu_type:
+            if hw.npu_type == "hexagon_nsp":
+                # 新代 NSP（X Elite / 8 Gen3）：用 Vulkan 加速
+                env["LLAMA_VULKAN"] = "1"
+                env["GGML_VULKAN"] = "1"
+                env["GGML_NPU"] = "1"
+            elif hw.npu_type == "hexagon_hvx":
+                # HVX DSP：配置 Vulkan 作为 fallback
+                env["GGML_VULKAN"] = "1"
+
         cmd = [sys.executable, "-m", "llama_cpp.server"]
         proc = subprocess.Popen(
             cmd,
@@ -435,7 +643,7 @@ def get_default_llm(cache_dir: Path | None = None, port: int = 18080) -> LocalLL
 
 
 def status_json(local_llm: LocalLLM | None, hw: HardwareProfile | None = None) -> dict:
-    """给 Web UI 返回可读的状态字典。"""
+    """给 Web UI 返回可读的状态字典（包含 NPU 信息）。"""
     hw = hw or detect_hardware()
     return {
         "hardware": {
@@ -445,6 +653,12 @@ def status_json(local_llm: LocalLLM | None, hw: HardwareProfile | None = None) -
             "ram_gb": hw.ram_gb,
             "has_gpu": hw.has_gpu,
             "gpu_type": hw.gpu_type,
+            "gpu_names": hw.gpu_names,
+            "has_npu": hw.has_npu,
+            "npu_type": hw.npu_type,
+            "npu_brand": hw.npu_brand,
+            "npu_tops": hw.npu_tops,
+            "npu_arch": hw.npu_arch,
             "recommended_model": hw.recommend_model(),
         },
         "models": local_llm.list_models() if local_llm else [],

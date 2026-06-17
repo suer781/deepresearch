@@ -640,11 +640,20 @@ async function loadEnv() {
     const items = [
       { label: "CPU Cores", value: data.hardware?.cpu_count || "?" },
       { label: "RAM", value: data.hardware?.ram_gb ? data.hardware.ram_gb + " GB" : "?" },
-      { label: "GPU", value: data.hardware?.has_gpu ? "✓ " + (data.hardware.gpu_names?.[0] || "") : "—" },
-      { label: "平台", value: data.hardware?.platform || "?" },
+      { label: "GPU", value: data.hardware?.has_gpu ? "✓ " + (data.hardware.gpu_names?.[0] || data.hardware.gpu_type || "") : "—" },
+      { label: "平台", value: data.hardware?.platform || (data.hardware?.system + " " + (data.hardware?.machine || "")) },
       { label: "本地 LLM", value: data.local_llm_running ? "✓ 运行中" : "未启动" },
       { label: "可用模型", value: (data.models_available || []).length },
     ];
+    // 骁龙 NPU 扩展显示
+    if (data.hardware?.has_npu) {
+      items.push({
+        label: "骁龙 NPU",
+        value: (data.hardware.npu_brand || data.hardware.npu_type || "?") +
+               " · " + (data.hardware.npu_tops ? data.hardware.npu_tops + " TOPS" : "") +
+               " · Hexagon " + (data.hardware.npu_arch || "?")
+      });
+    }
     grid.innerHTML = items.map(i =>
       `<div class="env-item"><div class="label">${i.label}</div><div class="value">${i.value}</div></div>`
     ).join("");
@@ -678,6 +687,14 @@ function renderModels(data) {
   const list = document.getElementById("model-list");
   const models = data.models_available || [];
   const recommend = data.recommended_model || "";
+  const hasNpu = data.hardware?.has_npu || false;
+  const npuBrand = data.hardware?.npu_brand || data.hardware?.npu_type || "";
+  const npuTops = data.hardware?.npu_tops ? data.hardware.npu_tops + " TOPS" : "";
+
+  // 如果有 NPU，给模型卡片加一个特殊标注
+  const npuNote = hasNpu
+    ? `<div style="font-size:0.72rem; color:var(--accent-2); margin-top:4px;">⚡ NPU 加速可用 · ${npuBrand}${npuTops ? " · " + npuTops : ""}</div>`
+    : "";
 
   list.innerHTML = models.map(m => {
     const downloaded = m.downloaded;
@@ -703,6 +720,7 @@ function renderModels(data) {
           <div>
             <div class="name">${m.name}${isRec ? '<span class="recommend">推荐</span>' : ''}</div>
             <div class="meta">${m.description || ''} · ${m.param_size || ''}</div>
+            ${hasNpu ? npuNote : ''}
           </div>
           <div style="display:flex; flex-direction:column; align-items:flex-end; gap: 6px;">
             <span class="size-pill">${sizeMB} MB</span>
