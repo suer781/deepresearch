@@ -16,7 +16,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
 <meta name="theme-color" content="#0f172a">
-<title>Deep Research · 超级并行研究</title>
+<title>Deep Research · 前沿技术研究与创新引擎</title>
 <style>
   :root {
     --bg: #0b1020;
@@ -63,6 +63,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
     background-clip: text;
     color: transparent;
     letter-spacing: 0.5px;
+  }
+  header .subtitle {
+    color: var(--accent-2);
+    font-size: 0.88rem;
+    margin: 0 0 6px;
+    font-weight: 500;
   }
   header .sub {
     color: var(--text-dim);
@@ -564,6 +570,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
 <header>
   <h1>⚡ Deep Research</h1>
+  <p class="subtitle">前沿技术研究与创新引擎 · 算法创新 · 效率突破 · 超级并行搜索</p>
   <div class="sub">多智能体并行搜索 · 本地部署 · 沙箱检索</div>
 </header>
 

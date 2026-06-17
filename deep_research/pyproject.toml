@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "deep-research"
 version = "0.1.0"
-description = "Super-parallel multi-agent deep research system with adversarial debate"
+description = "前沿技术研究与创新引擎 —— 深度推理、算法创新、效率突破设计、超级并行搜索、多智能体辩论"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
