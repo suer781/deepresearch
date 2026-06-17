@@ -718,45 +718,107 @@ async function loadEnv() {
 }
 
 // ====================== 模型列表渲染 ======================
+
+// 后端 subtype → 中文标签
+const BACKEND_LABEL_MAP = {
+  auto: "自动",
+  cpu: "CPU",
+  cuda: "NVIDIA CUDA",
+  rocm: "AMD ROCm",
+  metal: "Apple Metal",
+  vulkan: "Vulkan (通用GPU)",
+  snapdragon: "骁龙 Hexagon NPU",
+  intel_npu: "Intel NPU",
+  ascend: "华为昇腾",
+  openvino: "OpenVINO",
+};
+
+function _buildBackendList(hardware) {
+  // 根据检测到的 accelerators 生成完整的后端按钮列表
+  const accels = (hardware && hardware.accelerators) || [];
+  const uniqueSubtypes = [];
+  const seen = new Set();
+  for (const a of accels) {
+    if (!seen.has(a.subtype)) {
+      seen.add(a.subtype);
+      uniqueSubtypes.push(a);
+    }
+  }
+
+  // 基础：auto + cpu
+  const result = [
+    { value: "auto", label: "自动", kind: "meta", extra: "" },
+    { value: "cpu",  label: "CPU",  kind: "cpu",  extra: "" },
+  ];
+
+  // GPU 加速器（按检测到的顺序）
+  const gpuSubtypes = ["cuda", "rocm", "metal", "vulkan"];
+  for (const g of gpuSubtypes) {
+    if (uniqueSubtypes.some(a => a.subtype === g && a.kind === "gpu")) {
+      const detail = uniqueSubtypes.find(a => a.subtype === g && a.kind === "gpu");
+      result.push({
+        value: g,
+        label: BACKEND_LABEL_MAP[g] || g,
+        kind: "gpu",
+        extra: detail && detail.name ? `(${detail.name.substring(0, 22)})` : "",
+      });
+    }
+  }
+
+  // NPU 加速器
+  const npuSubtypes = ["snapdragon", "intel_npu", "ascend", "openvino"];
+  for (const n of npuSubtypes) {
+    if (uniqueSubtypes.some(a => a.subtype === n && a.kind === "npu")) {
+      const detail = uniqueSubtypes.find(a => a.subtype === n && a.kind === "npu");
+      result.push({
+        value: n,
+        label: BACKEND_LABEL_MAP[n] || n,
+        kind: "npu",
+        extra: detail && detail.brand ? `(${detail.brand}${detail.tops ? " " + detail.tops + " TOPS" : ""})` : "",
+      });
+    }
+  }
+
+  return { backends: result, accels: uniqueSubtypes };
+}
+
 function renderModels(data) {
   const list = document.getElementById("model-list");
   const models = data.models_available || [];
   const recommend = data.recommended_model || "";
-  const hasNpu = data.hardware?.has_npu || false;
-  const npuBrand = data.hardware?.npu_brand || data.hardware?.npu_type || "";
-  const npuTops = data.hardware?.npu_tops ? data.hardware.npu_tops + " TOPS" : "";
+  const { backends, accels } = _buildBackendList(data.hardware);
 
-  // 如果有 NPU，给模型卡片加一个特殊标注
-  const npuNote = hasNpu
-    ? `<div style="font-size:0.72rem; color:var(--accent-2); margin-top:4px;">⚡ NPU 加速可用 · ${npuBrand}${npuTops ? " · " + npuTops : ""}</div>`
-    : "";
+  // 在卡片顶部给用户一个提示，说明当前检测到的所有加速器
+  let accelInfo = "";
+  if (accels.length > 0) {
+    const gpuList = accels.filter(a => a.kind === "gpu");
+    const npuList = accels.filter(a => a.kind === "npu");
+    const parts = [];
+    if (gpuList.length) parts.push("✅ GPU × " + gpuList.length);
+    if (npuList.length) parts.push("✅ NPU × " + npuList.length);
+    accelInfo = parts.length
+      ? `<div style="font-size:0.72rem; color:var(--accent-2); margin-top:4px;">${parts.join(" · ")}</div>`
+      : "";
+  } else {
+    accelInfo = `<div style="font-size:0.72rem; color:var(--text-dim); margin-top:4px;">⚠ 未检测到可用加速器，将使用纯 CPU 推理</div>`;
+  }
 
-  // 存储用户当前选择的推理后端（模型ID → 后端）
   if (!window._modelBackends) window._modelBackends = {};
 
   list.innerHTML = models.map(m => {
     const downloaded = m.downloaded;
     const sizeMB = Math.round((m.size_bytes || 0) / 1024 / 1024);
     const isRec = m.id === recommend;
-    let statusBadge;
-    if (downloaded) {
-      statusBadge = `<span class="badge ready">已下载</span>`;
-    } else {
-      statusBadge = `<span class="badge notready">未下载</span>`;
-    }
+    const statusBadge = downloaded
+      ? `<span class="badge ready">已下载</span>`
+      : `<span class="badge notready">未下载</span>`;
 
-    // 推理后端选择（4选1）
-    const backends = [
-      { value: "auto", label: "自动" },
-      { value: "cpu",  label: "CPU" },
-      { value: "gpu",  label: "GPU" },
-      { value: "npu",  label: "NPU" },
-    ];
+    // 根据 accelerators 动态生成按钮
     const savedBackend = window._modelBackends[m.id] || "auto";
     const backendRadios = backends.map(b =>
-      `<label class="be-label${savedBackend === b.value ? ' active' : ''}" title="${b.label}"
+      `<label class="be-label${savedBackend === b.value ? ' active' : ''}" title="${b.label}${b.extra ? " " + b.extra : ""}"
                 onclick="window._modelBackends['${m.id}']='${b.value}'; this.parentElement.querySelectorAll('.be-label').forEach(l=>l.classList.remove('active')); this.classList.add('active')">
-         <span>${b.label}</span>
+         <span>${b.label}${b.extra ? '<br><span style="font-size:0.68rem; opacity:0.85;">' + b.extra + '</span>' : ''}</span>
        </label>`
     ).join("");
 
@@ -773,7 +835,7 @@ function renderModels(data) {
           <div>
             <div class="name">${m.name}${isRec ? '<span class="recommend">推荐</span>' : ''}</div>
             <div class="meta">${m.description || ''} · ${m.param_size || ''}</div>
-            ${hasNpu ? npuNote : ''}
+            ${accelInfo}
           </div>
           <div style="display:flex; flex-direction:column; align-items:flex-end; gap: 6px;">
             <span class="size-pill">${sizeMB} MB</span>
@@ -857,7 +919,7 @@ async function startModel(modelId) {
   const card = document.querySelector(`.model-card[data-id="${modelId}"]`);
   if (card) card.classList.add("active");
   const backend = window._modelBackends[modelId] || "auto";
-  const backendLabel = { auto: "自动", cpu: "CPU", gpu: "GPU", npu: "NPU" }[backend] || backend;
+  const backendLabel = BACKEND_LABEL_MAP[backend] || backend;
   toast(`启动 ${modelId} (${backendLabel})...`);
 
   try {
@@ -868,7 +930,7 @@ async function startModel(modelId) {
     runningModelServer = resp;
     document.getElementById("running-card").style.display = "block";
     const respBackend = resp.backend || backend;
-    const respBackendLabel = { auto: "自动", cpu: "CPU", gpu: "GPU", npu: "NPU" }[respBackend] || respBackend;
+    const respBackendLabel = BACKEND_LABEL_MAP[respBackend] || respBackend;
     document.getElementById("running-info").innerHTML =
       `✅ <b>${resp.model_name}</b> 已启动<br>` +
       `<code style="color:var(--accent-2)">${resp.base_url}</code><br>` +
@@ -876,7 +938,7 @@ async function startModel(modelId) {
     document.getElementById("research-mode-tag").textContent = `本地 · ${respBackendLabel} · 就绪`;
     document.getElementById("next-step").innerHTML =
       `✅ 模型已启动（<b>${respBackendLabel}</b>），点击上方 <b>Research</b> 开始研究。`;
-    toast(`模型已就绪！ (${respBackendLabel})`, "success");
+    toast(`模型已就绪！(${respBackendLabel})`, "success");
   } catch (err) {
     toast(String(err), "error");
   } finally {

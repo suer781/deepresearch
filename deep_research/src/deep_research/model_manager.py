@@ -86,24 +86,63 @@ DOWNLOAD_MIRRORS: list[str] = [
 
 # ---- 硬件检测 ----
 
+# 加速器类型枚举（后端映射到具体驱动/SDK）
+ACCEL_KIND_GPU = "gpu"
+ACCEL_KIND_NPU = "npu"
+
+# 所有已知加速器
+ACCEL_SUBTYPE_CUDA = "cuda"          # NVIDIA CUDA (NVIDIA GPU)
+ACCEL_SUBTYPE_ROCM = "rocm"          # AMD ROCm (AMD RDNA/Ryzen AI)
+ACCEL_SUBTYPE_METAL = "metal"        # Apple Metal (Apple Silicon GPU + ANE)
+ACCEL_SUBTYPE_VULKAN = "vulkan"      # Vulkan (Adreno/Intel Arc)
+ACCEL_SUBTYPE_INTEL_NPU = "intel_npu"   # Intel Core Ultra NPU (Meteor Lake / Arrow Lake)
+ACCEL_SUBTYPE_SNAPDRAGON = "snapdragon" # Qualcomm Hexagon NPU
+ACCEL_SUBTYPE_ASCEND = "ascend"      # Huawei 昇腾 (CANN/atb)
+ACCEL_SUBTYPE_OPENVINO = "openvino"    # Intel OpenVINO (兜底)
+
+
+@dataclass
+class Accelerator:
+    """一个加速器信息。"""
+    kind: str                      # "gpu" 或 "npu"
+    subtype: str                     # 具体后端类型（cuda/rocm/metal/vulkan/intel_npu/snapdragon/ascend）
+    name: str                      # 产品名，如 "NVIDIA GeForce RTX 4090"
+    brand: str                     # 品牌
+    tops: float | None = None           # 估算 TOPS 算力
+    arch: str | None = None       # 架构/代际代号
+    memory_gb: float | None = None # 显存/内存
+
+
 @dataclass
 class HardwareProfile:
     system: str
     machine: str  # x86_64 / arm64 / aarch64
     cpu_cores: int
     ram_gb: float
-    has_gpu: bool = False
-    gpu_type: str | None = None  # cuda / metal / adreno / vulkan
     gpu_names: list[str] = field(default_factory=list)
-    # ---- 骁龙 NPU ----
-    has_npu: bool = False
-    npu_type: str | None = None   # hexagon_hvx / hexagon_nsp / hexagon_pronto / qnn
-    npu_brand: str | None = None  # Snapdragon X Elite / Snapdragon 8 Gen 3 / ...
-    npu_tops: float | None = None  # NPU TOPS（估算）
-    npu_arch: str | None = None   # v65 / v66 / v68 / v69 / v73 / v75
+    # 通用加速器列表（按优先级排序：GPU > NPU，同组内按 TOPS 降序）
+    accelerators: list[Accelerator] = field(default_factory=list)
+
+    @property
+    def has_gpu(self) -> bool:
+        return any(a.kind == ACCEL_KIND_GPU for a in self.accelerators)
+
+    @property
+    def has_npu(self) -> bool:
+        return any(a.kind == ACCEL_KIND_NPU for a in self.accelerators)
+
+    @property
+    def best_gpu(self) -> Accelerator | None:
+        gpus = [a for a in self.accelerators if a.kind == ACCEL_KIND_GPU]
+        return gpus[0] if gpus else None
+
+    @property
+    def best_npu(self) -> Accelerator | None:
+        npus = [a for a in self.accelerators if a.kind == ACCEL_KIND_NPU]
+        return npus[0] if npus else None
 
     def recommend_model(self) -> str:
-        """根据内存推荐最合适的模型 ID（不考虑加速器，后端由用户自选）。"""
+        """根据内存推荐最合适的模型 ID。"""
         if self.ram_gb >= 18:
             return "qwen3-14b"
         if self.ram_gb >= 10:
@@ -112,26 +151,223 @@ class HardwareProfile:
             return "qwen3-1.7b"
         return "smollm-1.7b"
 
+    def best_accelerator_for_backend(self, backend: str) -> Accelerator | None:
+        """按后端名查找最合适的加速器。"""
+        for a in self.accelerators:
+            if a.subtype == backend:
+                return a
+        return None
 
-# ---- 骁龙 NPU 检测 ----
+    def detected_backends(self) -> list[str]:
+        """返回当前机器上实际检测到的后端类型列表（去重，保留顺序）。"""
+        seen: set[str] = set()
+        result: list[str] = []
+        for a in self.accelerators:
+            if a.subtype not in seen:
+                seen.add(a.subtype)
+                result.append(a.subtype)
+        return result
 
-def _detect_snapdragon_npu() -> tuple[bool, str | None, str | None, float | None, str | None]:
-    """检测 Snapdragon NPU（Hexagon DSP / Hexagon NPU）。
 
-    检测路径：
-      - Android/Linux: /proc/cpuinfo 中的 Qualcomm / Kryo 签名
-      - /dev/hvx （Hexagon Vector eXtension 协处理器）
-      - /sys/devices/soc0/ 路径（Android SoC 信息）
-    返回：(has_npu, npu_type, npu_brand, npu_tops, npu_arch)
+# ---- 通用加速器检测：多品牌扫描 ----
+
+# Snapdragon NPU (Hexagon) 映射表（按芯片型号 → 代际/TOPS）
+SNAPDRAGON_NPU_TABLE = [
+    # (pattern, npu_type(nsp/hvx), arch, tops)
+    ("Snapdragon X Elite",      "hexagon_nsp", "v75", 45.0),
+    ("Snapdragon X Plus",       "hexagon_nsp", "v75", 38.0),
+    ("Snapdragon 8 Gen 3",      "hexagon_nsp", "v73", 33.0),
+    ("Snapdragon 8 Gen 2",      "hexagon_nsp", "v69", 27.0),
+    ("Snapdragon 8 Gen 1",      "hexagon_nsp", "v68", 18.0),
+    ("Snapdragon 7[^,\n]*Gen",  "hexagon_nsp", "v66", 10.0),
+    ("Snapdragon 6[^,\n]*Gen",  "hexagon_hvx", "v65",  4.0),
+    ("Snapdragon 865",          "hexagon_hvx", "v62",  5.0),
+    ("Snapdragon 855",          "hexagon_hvx", "v60",  4.0),
+    ("Snapdragon 8cx",          "hexagon_hvx", "v60",  5.0),
+]
+
+
+def _detect_nvidia_gpus() -> list[Accelerator]:
+    """通过 nvidia-smi 检测 NVIDIA GPU。"""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            capture_output=True, timeout=10, check=False,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return []
+        accs: list[Accelerator] = []
+        for line in r.stdout.decode(errors="ignore").strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 1:
+                name = parts[0] or "NVIDIA GPU"
+                mem_gb: float | None = None
+                if len(parts) >= 2 and parts[1]:
+                    try:
+                        mem_mb = int(parts[1].split()[0])
+                        mem_gb = round(mem_mb / 1024, 1)
+                    except Exception:
+                        pass
+                accs.append(Accelerator(
+                    kind=ACCEL_KIND_GPU,
+                    subtype=ACCEL_SUBTYPE_CUDA,
+                    name=name,
+                    brand="NVIDIA",
+                    memory_gb=mem_gb,
+                    # 粗略估算 TOPS（不精确，只用于排序参考）
+                    tops=mem_gb * 25 if mem_gb else None,
+                ))
+        return accs
+    except Exception:
+        return []
+
+
+def _detect_amd_gpus() -> list[Accelerator]:
+    """通过 rocm-smi 检测 AMD GPU / ROCm。"""
+    try:
+        # 优先 rocm-smi，无则退回 lspci
+        r = subprocess.run(
+            ["rocm-smi", "--showproductname", "--json"],
+            capture_output=True, timeout=15, check=False,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            try:
+                data = json.loads(r.stdout)
+                accs: list[Accelerator] = []
+                for key, info in data.items():
+                    name = info.get("Card series", "") or info.get("Card SKU", "") or "AMD Radeon GPU"
+                    mem = info.get("VRAM (MB)", 0) or 0
+                    try:
+                        mem_gb = round(float(mem) / 1024, 1)
+                    except Exception:
+                        mem_gb = None
+                    accs.append(Accelerator(
+                        kind=ACCEL_KIND_GPU,
+                        subtype=ACCEL_SUBTYPE_ROCM,
+                        name=name,
+                        brand="AMD",
+                        memory_gb=mem_gb,
+                        tops=mem_gb * 20 if mem_gb else None,
+                    ))
+                return accs
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # fallback: lspci 扫描 "AMD/ATI Radeon" / "AMD Instinct"
+    accs: list[Accelerator] = []
+    try:
+        r = subprocess.run(["lspci"], capture_output=True, timeout=8, check=False)
+        if r.returncode == 0:
+            for line in r.stdout.decode(errors="ignore").splitlines():
+                low = line.lower()
+                if ("amd" in low or "radeon" in low) and ("3d" in low or "display" in low):
+                    name = line.split(":")[-1].strip() if ":" in line else line.strip()
+                    accs.append(Accelerator(
+                        kind=ACCEL_KIND_GPU,
+                        subtype=ACCEL_SUBTYPE_ROCM,
+                        name=name,
+                        brand="AMD",
+                        tops=30.0,
+                    ))
+    except Exception:
+        pass
+    return accs
+
+
+def _detect_intel_arc_or_npu() -> tuple[list[Accelerator], list[Accelerator]]:
+    """检测 Intel Arc GPU 和 Intel Core Ultra NPU (Meteor Lake / Arrow Lake)。
+
+    返回: (arc_gpus, intel_npus)
     """
     import re
+    gpus: list[Accelerator] = []
+    npus: list[Accelerator] = []
 
-    npu_type: str | None = None
-    npu_brand: str | None = None
-    npu_tops: float | None = None
-    npu_arch: str | None = None
+    # --- 方法 1: lspci（Linux） ---
+    try:
+        r = subprocess.run(["lspci"], capture_output=True, timeout=8, check=False)
+        if r.returncode == 0:
+            for line in r.stdout.decode(errors="ignore").splitlines():
+                low = line.lower()
+                # Intel Arc GPU
+                if "intel" in low and ("iris" in low or "arc" in low or "xe" in low):
+                    name = line.split(":")[-1].strip() if ":" in line else line.strip()
+                    gpus.append(Accelerator(
+                        kind=ACCEL_KIND_GPU,
+                        subtype=ACCEL_SUBTYPE_VULKAN,
+                        name=name,
+                        brand="Intel",
+                        tops=10.0,
+                    ))
+                # Intel NPU (Meteor Lake NPU, PCI device class 0b40)
+                if "0b40" in line or ("npu" in low and "intel" in low) or "neural processing" in low:
+                    name = "Intel Core Ultra NPU"
+                    if ":" in line:
+                        name = line.split(":")[-1].strip()
+                    npus.append(Accelerator(
+                        kind=ACCEL_KIND_NPU,
+                        subtype=ACCEL_SUBTYPE_INTEL_NPU,
+                        name=name,
+                        brand="Intel",
+                        tops=10.0,
+                        arch="Meteor Lake / Arrow Lake",
+                    ))
+    except Exception:
+        pass
 
-    # ---- 1. 读 /proc/cpuinfo ----
+    # --- 方法 2: /sys/class/accel (Linux 通用 NPU 子系统) ---
+    try:
+        import glob as _glob
+        for accel_path in _glob.glob("/sys/class/accel/accel*/"):
+            try:
+                name_file = accel_path + "device/name"
+                vendor_file = accel_path + "device/vendor"
+                device_file = accel_path + "device/device"
+                name = "Unknown Accelerator"
+                if os.path.exists(name_file):
+                    name = open(name_file).read().strip()
+                # 读取 vendor ID
+                vendor = ""
+                if os.path.exists(vendor_file):
+                    vendor = open(vendor_file).read().strip()
+                if os.path.exists(device_file):
+                    dev = open(device_file).read().strip()
+                    # 0x8086 = Intel
+                    if "8086" in vendor or "intel" in name.lower():
+                        npus.append(Accelerator(
+                            kind=ACCEL_KIND_NPU,
+                            subtype=ACCEL_SUBTYPE_INTEL_NPU,
+                            name=name,
+                            brand="Intel",
+                            tops=10.0,
+                            arch="Core Ultra NPU",
+                        ))
+                    # 0x19e5 = 华为昇腾 (HiSilicon)
+                    elif "19e5" in vendor or "ascend" in name.lower() or "huawei" in name.lower():
+                        npus.append(Accelerator(
+                            kind=ACCEL_KIND_NPU,
+                            subtype=ACCEL_SUBTYPE_ASCEND,
+                            name=name,
+                            brand="Huawei Ascend",
+                            tops=16.0,
+                            arch="昇腾",
+                        ))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return gpus, npus
+
+
+def _detect_snapdragon_npu() -> list[Accelerator]:
+    """检测 Qualcomm Snapdragon Hexagon NPU（移动端 SoC / X Elite）。"""
+    import re
+    accs: list[Accelerator] = []
+
+    # --- 1. /proc/cpuinfo 中的 Qualcomm / Kryo 签名 ---
     cpuinfo = ""
     try:
         with open("/proc/cpuinfo") as f:
@@ -139,14 +375,13 @@ def _detect_snapdragon_npu() -> tuple[bool, str | None, str | None, float | None
     except Exception:
         pass
 
-    # Qualcomm Snapdragon 签名检测
     is_qualcomm = bool(
         re.search(r"Hardware\s*[:=]\s*.*[Qq]ualcomm", cpuinfo) or
         re.search(r"model name\s*[:=]\s*Kryo", cpuinfo) or
         re.search(r"CPU architecture.*AArch64.*Qualcomm", cpuinfo)
     )
 
-    # 提取 Snapdragon 型号
+    npu_brand: str | None = None
     for pattern in [
         r"(Snapdragon\s+X\s*Elite)",
         r"(Snapdragon\s+X\s*Plus)",
@@ -162,28 +397,22 @@ def _detect_snapdragon_npu() -> tuple[bool, str | None, str | None, float | None
             npu_brand = m.group(1).strip()
             break
 
-    if not is_qualcomm and not npu_brand:
-        return False, None, None, None, None
-
-    # ---- 2. 检测 Hexagon HVX 协处理器 ----
-    has_hvx = False
+    # --- 2. Hexagon HVX 协处理器设备节点 ---
     try:
         import os as _os
         has_hvx = (
             _os.path.exists("/dev/hvx") or
             _os.path.exists("/dev/qvr-hvx") or
-            _os.path.exists("/dev/adsprpc") or
-            bool(_os.listdir("/dev/"))
+            _os.path.exists("/dev/adsprpc")
         )
     except Exception:
-        pass
+        has_hvx = False
 
-    # ---- 3. 读 /sys/devices/soc0/ (Android) ----
+    # --- 3. /sys/devices/soc0/ 路径 ---
     soc_family = ""
     try:
-        soc_paths = ["/sys/devices/soc0/", "/sys/firmware/devicetree/base/"]
-        for sp in soc_paths:
-            for fname in ["family", "machine", "soc_id"]:
+        for sp in ["/sys/devices/soc0/", "/sys/firmware/devicetree/base/"]:
+            for fname in ["family", "machine"]:
                 for attempt in [f"{sp}{fname}", f"{sp}@{fname}"]:
                     try:
                         val = open(attempt).read().strip()[:64]
@@ -194,45 +423,181 @@ def _detect_snapdragon_npu() -> tuple[bool, str | None, str | None, float | None
     except Exception:
         pass
 
-    # ---- 4. 根据芯片代数推断 NPU 能力 ----
-    # Snapdragon NPU (Hexagon) 代数 → 估算 TOPS
-    SNAPDragon_NPU_TABLE = [
-        ("Snapdragon X Elite",      "hexagon_nsp", "v75", 45.0),
-        ("Snapdragon X Plus",       "hexagon_nsp", "v75", 38.0),
-        ("Snapdragon 8 Gen 3",      "hexagon_nsp", "v73", 33.0),
-        ("Snapdragon 8 Gen 2",      "hexagon_nsp", "v69", 27.0),
-        ("Snapdragon 8 Gen 1",      "hexagon_nsp", "v68", 18.0),
-        ("Snapdragon 7[^,\n]*Gen",  "hexagon_nsp", "v66", 10.0),
-        ("Snapdragon 6[^,\n]*Gen",  "hexagon_hvx", "v65",  4.0),
-        ("Snapdragon 865",          "hexagon_hvx", "v62",  5.0),
-        ("Snapdragon 855",          "hexagon_hvx", "v60",  4.0),
-        ("Snapdragon 8cx",          "hexagon_hvx", "v60",  5.0),
-    ]
+    if not is_qualcomm and not npu_brand and not soc_family:
+        return accs
 
+    # --- 4. 查表推断代际 ---
+    selected_ntype = "hexagon_hvx"
+    selected_arch = "v60"
+    selected_tops = 3.5
     if npu_brand:
-        for pattern, ntype, arch, tops in SNAPDragon_NPU_TABLE:
+        for pattern, ntype, arch, tops in SNAPDRAGON_NPU_TABLE:
             if re.search(pattern, npu_brand, re.IGNORECASE):
-                npu_type = ntype
-                npu_arch = arch
-                npu_tops = tops
+                selected_ntype = ntype
+                selected_arch = arch
+                selected_tops = tops
                 break
 
-    if npu_type is None:
-        # 已检测到 Qualcomm 但没匹配具体型号
-        if has_hvx or soc_family:
-            npu_type = "hexagon_hvx"
-            npu_arch = "v60"
-            npu_tops = 3.5
-        else:
-            npu_type = "hexagon_hvx"
-            npu_arch = "v50"
-            npu_tops = 2.0
+    # Adreno GPU（骁龙自带）
+    try:
+        import glob as _glob
+        for d in _glob.glob("/sys/class/drm/card*/device/name"):
+            try:
+                name = open(d).read().strip()
+                if "adreno" in name.lower():
+                    accs.append(Accelerator(
+                        kind=ACCEL_KIND_GPU,
+                        subtype=ACCEL_SUBTYPE_VULKAN,
+                        name=name,
+                        brand="Qualcomm",
+                        tops=2.5,
+                    ))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    return True, npu_type, npu_brand, npu_tops, npu_arch
+    accs.append(Accelerator(
+        kind=ACCEL_KIND_NPU,
+        subtype=ACCEL_SUBTYPE_SNAPDRAGON,
+        name="Qualcomm Hexagon NPU " + (npu_brand or ""),
+        brand="Qualcomm",
+        tops=selected_tops,
+        arch=selected_arch,
+    ))
+    return accs
+
+
+def _detect_ascend_npus() -> list[Accelerator]:
+    """检测华为昇腾 (Ascend) NPU / AI Accelerator。"""
+    accs: list[Accelerator] = []
+
+    # --- 1. npu-smi (官方 CLI) ---
+    try:
+        r = subprocess.run(["npu-smi", "info", "-l"], capture_output=True, timeout=10, check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            text = r.stdout.decode(errors="ignore")
+            for line in text.splitlines():
+                if "npu" in line.lower() or "chip" in line.lower() or "type" in line.lower():
+                    accs.append(Accelerator(
+                        kind=ACCEL_KIND_NPU,
+                        subtype=ACCEL_SUBTYPE_ASCEND,
+                        name="Huawei Ascend NPU " + line.strip(),
+                        brand="Huawei Ascend",
+                        tops=16.0,
+                        arch="Ascend 310 / 910",
+                    ))
+    except Exception:
+        pass
+
+    # --- 2. /sys/class/cann / /sys/class/npu 路径（华为 CANN 驱动） ---
+    try:
+        import glob as _glob
+        for npu_path in _glob.glob("/sys/class/npu/npu*/"):
+            try:
+                name_file = npu_path + "device/name"
+                name = "Ascend NPU"
+                if os.path.exists(name_file):
+                    name = open(name_file).read().strip()
+                accs.append(Accelerator(
+                    kind=ACCEL_KIND_NPU,
+                    subtype=ACCEL_SUBTYPE_ASCEND,
+                    name=name,
+                    brand="Huawei Ascend",
+                    tops=16.0,
+                    arch="Ascend",
+                ))
+            except Exception:
+                pass
+        for npu_path in _glob.glob("/sys/class/cann/*/"):
+            try:
+                name_file = npu_path + "device/name"
+                name = "Ascend NPU (CANN)"
+                if os.path.exists(name_file):
+                    name = open(name_file).read().strip()
+                accs.append(Accelerator(
+                    kind=ACCEL_KIND_NPU,
+                    subtype=ACCEL_SUBTYPE_ASCEND,
+                    name=name,
+                    brand="Huawei Ascend",
+                    tops=16.0,
+                    arch="Ascend CANN",
+                ))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # --- 3. lsascend ---
+    try:
+        r = subprocess.run(["lsascend"], capture_output=True, timeout=8, check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            for line in r.stdout.decode(errors="ignore").splitlines():
+                accs.append(Accelerator(
+                    kind=ACCEL_KIND_NPU,
+                    subtype=ACCEL_SUBTYPE_ASCEND,
+                    name="Ascend " + line.strip(),
+                    brand="Huawei Ascend",
+                    tops=16.0,
+                    arch="Ascend",
+                ))
+    except Exception:
+        pass
+
+    return accs
+
+
+def _detect_apple_metal() -> list[Accelerator]:
+    """macOS 上检测 Apple Silicon（用 Metal 加速 GPU+ANE）。"""
+    if platform.system() != "Darwin":
+        return []
+
+    # sysctl 查询 chip 信息
+    chip_name = "Apple Silicon"
+    try:
+        r = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                         capture_output=True, timeout=5, check=False)
+        if r.stdout.strip():
+            chip_name = r.stdout.decode(errors="ignore").strip()
+    except Exception:
+        pass
+
+    try:
+        # hw.memsize
+        r = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                         capture_output=True, timeout=5, check=False)
+        if r.stdout.strip():
+            mem_bytes = int(r.stdout.decode().strip())
+            ram_gb_hint = round(mem_bytes / (1024**3), 1)
+        else:
+            ram_gb_hint = 16.0
+    except Exception:
+        ram_gb_hint = 16.0
+
+    # TOPS 粗略估算（MacBook Pro M3 ≈ 15-25 TOPS）
+    tops_estimate = ram_gb_hint * 1.5
+
+    return [Accelerator(
+        kind=ACCEL_KIND_GPU,
+        subtype=ACCEL_SUBTYPE_METAL,
+        name=chip_name + " (Metal GPU + ANE)",
+        brand="Apple",
+        tops=tops_estimate,
+        memory_gb=ram_gb_hint,
+    )]
+
+
+def _sort_accelerators(accs: list[Accelerator]) -> list[Accelerator]:
+    """GPU 优先于 NPU；同组内按 TOPS 降序。"""
+    def sort_key(a):
+        kind_prio = 0 if a.kind == ACCEL_KIND_GPU else 1
+        tops_prio = -(a.tops or 0.0)
+        return (kind_prio, tops_prio)
+    return sorted(accs, key=sort_key)
 
 
 def detect_hardware() -> HardwareProfile:
-    """检测 CPU / 内存 / GPU / 骁龙 NPU。"""
+    """检测 CPU / 内存 / 所有加速器（GPU + NPU 多品牌）。"""
     system = platform.system()
     machine = platform.machine()
     cores = os.cpu_count() or 4
@@ -260,71 +625,51 @@ def detect_hardware() -> HardwareProfile:
     except Exception:
         pass
 
-    # GPU 检测
-    gpu = False
-    gpu_type: str | None = None
-    gpu_names: list[str] = []
+    # --- 并行扫描所有加速器品牌 ---
+    all_accs: list[Accelerator] = []
+
+    # 1. Apple Metal
     if system == "Darwin":
-        gpu = True
-        gpu_type = "metal"
-    else:
-        # NVIDIA CUDA
-        try:
-            r = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                capture_output=True, timeout=8, check=False,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                gpu = True
-                gpu_type = "cuda"
-                gpu_names = [n.strip() for n in r.stdout.strip().splitlines() if n.strip()]
-        except Exception:
-            pass
+        all_accs.extend(_detect_apple_metal())
 
-        # Qualcomm Adreno GPU（Android / 骁龙设备）
-        if not gpu:
-            try:
-                import glob as _glob
-                # /sys/class/drm/card*/device/name
-                for pattern in ["/sys/class/drm/card*/device/name"]:
-                    for d in _glob.glob(pattern):
-                        try:
-                            name = open(d).read().strip()
-                            if "adreno" in name.lower() or "qualcomm" in name.lower():
-                                gpu = True
-                                gpu_type = "adreno"
-                                gpu_names.append(name)
-                        except Exception:
-                            pass
-                # /sys/class/graphics/fb0/name (framebuffer)
-                for fb in _glob.glob("/sys/class/graphics/fb*/name"):
-                    try:
-                        name = open(fb).read().strip()
-                        if "adreno" in name.lower():
-                            gpu = True
-                            gpu_type = "adreno"
-                            gpu_names.append(name)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+    # 2. NVIDIA CUDA
+    all_accs.extend(_detect_nvidia_gpus())
 
-    # 骁龙 NPU 检测
-    has_npu, npu_type, npu_brand, npu_tops, npu_arch = _detect_snapdragon_npu()
+    # 3. AMD ROCm
+    all_accs.extend(_detect_amd_gpus())
+
+    # 4. Intel Arc + Intel Core Ultra NPU
+    intel_gpus, intel_npus = _detect_intel_arc_or_npu()
+    all_accs.extend(intel_gpus)
+    all_accs.extend(intel_npus)
+
+    # 5. Qualcomm Snapdragon Hexagon NPU + Adreno
+    all_accs.extend(_detect_snapdragon_npu())
+
+    # 6. Huawei Ascend
+    all_accs.extend(_detect_ascend_npus())
+
+    # 7. 去重（相同 brand+name 只保留一个）
+    seen = set()
+    unique_accs: list[Accelerator] = []
+    for a in all_accs:
+        key = (a.brand, a.name)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_accs.append(a)
+
+    # 8. 排序（GPU > NPU，按 TOPS）
+    sorted_accs = _sort_accelerators(unique_accs)
+    gpu_names = [a.name for a in sorted_accs if a.kind == ACCEL_KIND_GPU]
 
     return HardwareProfile(
         system=system,
         machine=machine,
         cpu_cores=cores,
         ram_gb=round(ram_gb, 1),
-        has_gpu=gpu,
-        gpu_type=gpu_type,
         gpu_names=gpu_names,
-        has_npu=has_npu,
-        npu_type=npu_type,
-        npu_brand=npu_brand,
-        npu_tops=npu_tops,
-        npu_arch=npu_arch,
+        accelerators=sorted_accs,
     )
 
 
@@ -560,60 +905,94 @@ class LocalLLM:
     # ---- 启动 ----
 
     def _configure_backend_env(self, backend: str, hw: HardwareProfile) -> dict[str, str]:
-        """根据用户选择的推理后端配置环境变量，返回 env dict。"""
+        """根据用户选择的推理后端配置环境变量，返回 env dict。
+
+        backend 可接受：
+          - "auto" / "cpu"
+          - "cuda"  / "rocm" / "metal" / "vulkan"
+          - "intel_npu" / "snapdragon" / "ascend"
+          - "openvino"
+        """
         env = os.environ.copy()
 
+        def clear_acc_flags(target_env: dict):
+            for key in ["GGML_CUDA", "GGML_METAL", "GGML_VULKAN", "GGML_HVX",
+                        "GGML_NPU", "GGML_CPU_ONLY", "GGML_SYCL", "GGML_OPENCL",
+                        "LLAMA_CUDA", "LLAMA_METAL", "LLAMA_VULKAN"]:
+                target_env.pop(key, None)
+
+        clear_acc_flags(env)
+
         if backend == "cpu":
-            # 纯 CPU，无任何加速
             env["GGML_CPU_ONLY"] = "1"
-            env.pop("GGML_VULKAN", None)
-            env.pop("GGML_CUDA", None)
-            env.pop("GGML_METAL", None)
-            env.pop("LLAMA_VULKAN", None)
-
-        elif backend == "gpu":
-            # GPU 加速：按检测到的 GPU 类型选后端
-            if hw.gpu_type == "metal":
-                env["GGML_METAL"] = "1"
-                env["LLAMA_METAL"] = "1"
-            elif hw.gpu_type == "cuda":
-                env["GGML_CUDA"] = "1"
-                env["LLAMA_CUDA"] = "1"
-            elif hw.gpu_type == "adreno":
-                env["GGML_VULKAN"] = "1"
-                env["LLAMA_VULKAN"] = "1"
-            else:
-                # 有 GPU 但类型未知，默认 Vulkan
-                env["GGML_VULKAN"] = "1"
-                env["LLAMA_VULKAN"] = "1"
-
-        elif backend == "npu":
-            # 骁龙 Hexagon NPU（用户明确选择）
-            if hw.has_npu and hw.npu_type == "hexagon_nsp":
-                # 新代 NSP（X Elite / 8 Gen3）
-                env["GGML_VULKAN"] = "1"
-                env["LLAMA_VULKAN"] = "1"
-                env["GGML_NPU"] = "1"
-                env["GGML_HVX"] = "1"
-            elif hw.has_npu and hw.npu_type == "hexagon_hvx":
-                # HVX DSP
-                env["GGML_VULKAN"] = "1"
-                env["GGML_HVX"] = "1"
-            else:
-                # 检测不到 NPU 时给出提示，但仍然尝试 Vulkan
-                env["GGML_VULKAN"] = "1"
-                env["LLAMA_VULKAN"] = "1"
 
         elif backend == "auto":
-            # 自动选择：GPU > NPU > CPU
-            if hw.gpu_type in ("cuda", "metal"):
-                env["GGML_CUDA"] = "1" if hw.gpu_type == "cuda" else "0"
-                env["GGML_METAL"] = "1" if hw.gpu_type == "metal" else "0"
-            elif hw.has_npu:
+            # 选列表第一个加速器
+            best = hw.accelerators[0] if hw.accelerators else None
+            if best is None:
+                env["GGML_CPU_ONLY"] = "1"
+            elif best.subtype == ACCEL_SUBTYPE_CUDA:
+                env["GGML_CUDA"] = "1"
+            elif best.subtype == ACCEL_SUBTYPE_METAL:
+                env["GGML_METAL"] = "1"
+            elif best.subtype == ACCEL_SUBTYPE_ROCM:
+                # AMD ROCm：目前用 HIPBLAS + Vulkan 路径
+                env["GGML_VULKAN"] = "1"
+                env["LLAMA_VULKAN"] = "1"
+            elif best.subtype == ACCEL_SUBTYPE_VULKAN:
+                env["GGML_VULKAN"] = "1"
+                env["LLAMA_VULKAN"] = "1"
+            elif best.subtype == ACCEL_SUBTYPE_SNAPDRAGON:
                 env["GGML_VULKAN"] = "1"
                 env["GGML_HVX"] = "1"
+                env["GGML_NPU"] = "1"
+            elif best.subtype == ACCEL_SUBTYPE_INTEL_NPU:
+                env["GGML_VULKAN"] = "1"
+                env["GGML_SYCL"] = "1"
+            elif best.subtype == ACCEL_SUBTYPE_ASCEND:
+                env["GGML_VULKAN"] = "1"
+                env["GGML_SYCL"] = "1"
             else:
                 env["GGML_CPU_ONLY"] = "1"
+
+        # ---- GPU 后端 ----
+        elif backend == "cuda":
+            env["GGML_CUDA"] = "1"
+            env["LLAMA_CUDA"] = "1"
+
+        elif backend == "rocm":
+            env["GGML_VULKAN"] = "1"
+            env["LLAMA_VULKAN"] = "1"
+
+        elif backend == "metal":
+            env["GGML_METAL"] = "1"
+            env["LLAMA_METAL"] = "1"
+
+        elif backend == "vulkan":
+            env["GGML_VULKAN"] = "1"
+            env["LLAMA_VULKAN"] = "1"
+
+        # ---- NPU 后端 ----
+        elif backend == "snapdragon":
+            env["GGML_VULKAN"] = "1"
+            env["GGML_HVX"] = "1"
+            env["GGML_NPU"] = "1"
+
+        elif backend == "intel_npu":
+            env["GGML_VULKAN"] = "1"
+            env["GGML_SYCL"] = "1"
+
+        elif backend == "ascend":
+            env["GGML_VULKAN"] = "1"
+            env["GGML_SYCL"] = "1"
+
+        # ---- 兜底后端 ----
+        elif backend == "openvino":
+            env["GGML_SYCL"] = "1"
+
+        else:
+            # 未知后端 → 退回 CPU
+            env["GGML_CPU_ONLY"] = "1"
 
         return env
 
@@ -626,11 +1005,11 @@ class LocalLLM:
     ) -> RunningServer:
         """启动 llama_cpp.server，返回可调用的 RunningServer。
 
-        backend（推理后端）: "auto" | "cpu" | "gpu" | "npu"
-          - auto  : GPU > NPU > CPU（根据检测结果自动选择）
-          - cpu   : 纯 CPU 推理，无加速
-          - gpu   : GPU 加速（CUDA / Metal / Vulkan）
-          - npu   : 骁龙 Hexagon NPU 加速
+        backend 可接受：
+          - "auto" / "cpu"
+          - "cuda" / "rocm" / "metal" / "vulkan"
+          - "intel_npu" / "snapdragon" / "ascend"
+          - "openvino"
 
         接口：http://localhost:<port>/v1/chat/completions （与 OpenAI 兼容）
         """
@@ -702,8 +1081,22 @@ def get_default_llm(cache_dir: Path | None = None, port: int = 18080) -> LocalLL
 
 
 def status_json(local_llm: LocalLLM | None, hw: HardwareProfile | None = None) -> dict:
-    """给 Web UI 返回可读的状态字典（包含 NPU 信息）。"""
+    """给 Web UI 返回可读的状态字典（包含完整的加速器列表）。"""
     hw = hw or detect_hardware()
+
+    # 把 accelerators 转成前端可读取的 list[dict]
+    accel_dicts = []
+    for a in hw.accelerators:
+        accel_dicts.append({
+            "kind": a.kind,           # "gpu" 或 "npu"
+            "subtype": a.subtype,     # "cuda" / "rocm" / "metal" / "snapdragon" / ...
+            "name": a.name,
+            "brand": a.brand,
+            "tops": a.tops,
+            "arch": a.arch,
+            "memory_gb": a.memory_gb,
+        })
+
     return {
         "hardware": {
             "system": hw.system,
@@ -711,13 +1104,12 @@ def status_json(local_llm: LocalLLM | None, hw: HardwareProfile | None = None) -
             "cpu_cores": hw.cpu_cores,
             "ram_gb": hw.ram_gb,
             "has_gpu": hw.has_gpu,
-            "gpu_type": hw.gpu_type,
-            "gpu_names": hw.gpu_names,
             "has_npu": hw.has_npu,
-            "npu_type": hw.npu_type,
-            "npu_brand": hw.npu_brand,
-            "npu_tops": hw.npu_tops,
-            "npu_arch": hw.npu_arch,
+            "gpu_names": hw.gpu_names,
+            # 检测到的所有加速器（用于 UI 动态显示后端选择）
+            "accelerators": accel_dicts,
+            # 检测到的唯一后端 subtype 列表
+            "detected_backends": hw.detected_backends(),
             "recommended_model": hw.recommend_model(),
         },
         "models": local_llm.list_models() if local_llm else [],

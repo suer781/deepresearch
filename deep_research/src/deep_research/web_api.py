@@ -294,7 +294,11 @@ async def start_model_server(
       - gpu  : GPU 加速（CUDA / Metal / Vulkan）
       - npu  : 骁龙 Hexagon NPU 加速
     """
-    VALID_BACKENDS = {"auto", "cpu", "gpu", "npu"}
+    VALID_BACKENDS = {
+        "auto", "cpu",
+        "cuda", "rocm", "metal", "vulkan",
+        "snapdragon", "intel_npu", "ascend", "openvino",
+    }
     if backend not in VALID_BACKENDS:
         raise HTTPException(400, f"Invalid backend. Must be one of: {VALID_BACKENDS}")
 
