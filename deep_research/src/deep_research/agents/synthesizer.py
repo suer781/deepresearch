@@ -42,23 +42,28 @@ class SynthesizerAgent(BaseAgent):
         super().__init__()
         self.store = evidence_store
 
-    async def run(self, question: str) -> Report:
+    async def run(self, question: str, extra_context: str = "") -> Report:
+        """生成报告，可选注入额外的上下文（如图谱摘要、高影响证据等）。"""
         all_ev = self.store.all()
         if not all_ev:
             return Report(title=question, question=question, confidence_overall=0.0)
 
-        # 按主题聚类（这里简单按 sources 维度组织）
+        # 按主题聚类
         evidence_summary = "\n".join(
             f"[{ev.id}] (conf={ev.confidence:.2f}, src={ev.source_name or ev.source})\n"
             f"  Claim: {ev.claim}\n  Evidence: {ev.snippet}"
-            for ev in all_ev[:80]  # 防止超长
+            for ev in all_ev[:80]
         )
 
-        result = await self.think_json(
+        prompt = (
             f"研究问题：{question}\n\n"
             f"证据库（{len(all_ev)} 条）：\n{evidence_summary}\n\n"
-            f"请生成最终报告。"
         )
+        if extra_context:
+            prompt += f"\n附加上下文（图谱分析、高影响证据、矛盾检测）：\n{extra_context}\n\n"
+        prompt += "请生成最终报告。"
+
+        result = await self.think_json(prompt)
 
         return Report(
             title=result.get("title", question),

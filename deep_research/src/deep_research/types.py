@@ -160,3 +160,65 @@ class Report(BaseModel):
     confidence_overall: float = 0.5
     generated_at: datetime = Field(default_factory=datetime.now)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------- 增强推理类型 ----------
+
+class ReflectionRound(BaseModel):
+    """一次反思循环的结果。"""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    round: int                          # 第几轮反思
+    question: str                        # 反思问题（如"遗漏了什么？"）
+    answer: str                          # 反思回答
+    gaps: list[str] = Field(default_factory=list)   # 识别出的缺口
+    suggested_actions: list[str] = Field(default_factory=list)   # 建议的后续行动
+    iteration_needed: bool = True        # 是否需要继续迭代
+    concluded_at: datetime = Field(default_factory=datetime.now)
+
+
+class Contradiction(BaseModel):
+    """证据冲突记录。"""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    evidence_a: str                      # 证据 A 的 ID
+    evidence_b: str                      # 证据 B 的 ID
+    claim_a: str                         # A 的主张
+    claim_b: str                         # B 的主张
+    conflict_type: str                   # "direct" / "implication" / "statistical"
+    severity: float = 0.5               # 冲突严重程度 0-1
+    resolved: bool = False
+    resolution: str = ""                 # 如何解决
+
+
+class BottleneckNode(BaseModel):
+    """论点图谱中的瓶颈节点。"""
+    evidence_id: str
+    stance: str
+    importance_score: float              # PageRank 类重要性分数
+    dependents: int                      # 有多少论点依赖此证据
+    is_critical: bool = False           # 是否是关键瓶颈
+
+
+class EfficiencyAnalysis(BaseModel):
+    """效率瓶颈分析（用于技术创新场景）。"""
+    current_state: str                  # 当前最优方案描述
+    bottleneck_type: str                # "memory" / "compute" / "communication" / "io"
+    bottleneck_location: str             # 瓶颈所在位置（如 "KV cache", "attention matmul"）
+    quantified_gap: str                 # 量化的差距（如 "内存带宽 10x 低于计算需求"）
+    theoretical_limit: str              # 理论极限
+    proposed_solutions: list[dict[str, str]] = Field(default_factory=list)
+    # 每个方案: {name, mechanism, expected_speedup, applicability}
+
+
+class InnovationProposal(BaseModel):
+    """创新方案（技术创新引擎输出）。"""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    core_insight: str                  # 核心洞察（为什么这个方案有效）
+    mechanism: str                      # 机制描述
+    expected_speedup: str               # 预期加速比（如 "2-5x faster"）
+    memory_savings: str = ""            # 内存节省
+    applicability: str                  # 适用场景
+    prerequisites: list[str] = Field(default_factory=list)  # 前置条件
+    risks: list[str] = Field(default_factory=list)        # 风险点
+    implementation_difficulty: str       # "low" / "medium" / "high"
+    related_evidence_ids: list[str] = Field(default_factory=list)
