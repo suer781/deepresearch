@@ -1,8 +1,8 @@
-"""搜索子智能体 - 接收子任务，调用搜索源，返回证据。"""
+"""搜索子智能体 - 接收子任务，通过搜索沙箱调用多个搜索引擎。"""
 from __future__ import annotations
 
 from ..memory.evidence_store import EvidenceStore
-from ..sources import get_source
+from ..sandbox import SearchSandbox, get_sandbox
 from ..types import AgentRole, Evidence, SubTask
 from .base import BaseAgent
 
@@ -37,14 +37,14 @@ class SearcherAgent(BaseAgent):
     role = AgentRole.SEARCHER
     system_prompt = SEARCHER_SYSTEM
 
-    def __init__(self, evidence_store: EvidenceStore, local_mode: bool = False) -> None:
+    def __init__(self, evidence_store, local_mode: bool = False, sandbox=None):
         super().__init__()
         self.store = evidence_store
         self.local_mode = local_mode
+        self.sandbox = sandbox or get_sandbox()
 
     async def run(self, task: SubTask) -> list[Evidence]:
         """执行子任务，搜索并保存证据。"""
-        # 步骤 1: 让 LLM 构造查询和提取策略
         from ..sources import filter_to_local, get_default_sources
         preferred = filter_to_local(task.preferred_sources) if self.local_mode else task.preferred_sources
         if not preferred:
@@ -57,25 +57,26 @@ class SearcherAgent(BaseAgent):
         )
         queries = plan.get("queries_used", [task.question])
 
-        # 步骤 2: 调用搜索源（异步并行）
+        # 步骤 2: 通过沙箱并行搜索（每个源独立超时/失败隔离）
         import asyncio
-        results_per_query: list[list[dict]] = await asyncio.gather(
-            *[_search_with_sources(q, preferred) for q in queries]
-        )
+        results_per_query: list = []
+        for q in queries:
+            run = await self.sandbox.search(q, sources=preferred)
+            results_per_query.append(run)
 
-        # 步骤 3: 让 LLM 从原始结果中筛选证据
+        # 步骤 3: LLM 从原始结果中筛选证据
         import json
-        raw_combined = []
-        for q, results in zip(queries, results_per_query):
-            for r in results:
-                raw_combined.append({"query": q, **r})
+        combined = []
+        for q, run in zip(queries, results_per_query):
+            for r in run.to_agent_format():
+                combined.append({"query": q, **r})
 
-        if not raw_combined:
+        if not combined:
             return []
 
         extract = await self.think_json(
             f"子问题：{task.question}\n\n"
-            f"原始搜索结果：\n{json.dumps(raw_combined[:30], ensure_ascii=False)}\n\n"
+            f"原始搜索结果：\n{json.dumps(combined[:30], ensure_ascii=False)}\n\n"
             f"从中筛选 5-10 条最相关的证据。"
         )
 
@@ -93,26 +94,3 @@ class SearcherAgent(BaseAgent):
             evidence_list.append(ev)
 
         return evidence_list
-
-
-async def _search_with_sources(query: str, preferred: list[str]) -> list[dict]:
-    """对一个查询，依次尝试偏好源，合并结果。"""
-    import asyncio
-    sources_to_try = preferred or ["tavily", "duckduckgo", "wikipedia"]
-    results: list[dict] = []
-
-    # 限制并发数
-    sem = asyncio.Semaphore(3)
-
-    async def _try(name: str) -> list[dict]:
-        async with sem:
-            try:
-                src = get_source(name)
-                return await src.search(query, top_k=5)
-            except Exception:
-                return []
-
-    out = await asyncio.gather(*[_try(n) for n in sources_to_try[:3]])
-    for chunk in out:
-        results.extend(chunk)
-    return results[:10]

@@ -80,6 +80,22 @@ def _install_deps() -> None:
             check=True,
         )
 
+    # llama-cpp-python（本地模型推理核心库）
+    try:
+        import llama_cpp  # noqa: F401
+    except ImportError:
+        _print("安装 llama-cpp-python （本地模型推理）...", "📦")
+        # 仅安装 CPU 版本；如需 GPU/CUDA 请手动安装带编译 flag 的版本
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "llama-cpp-python", "-q"],
+                check=True,
+                timeout=600,
+            )
+        except Exception as e:
+            _print(f"llama-cpp-python 安装失败，可能需要手动编译: {e}", "⚠️")
+            _print("参考：CMAKE_ARGS=\"-DLLAMA_BLAS=ON -DLLAMA_BLAS_VENDOR=OpenBLAS\" pip install llama-cpp-python", "ℹ️")
+
     # 搜索依赖
     deps = [
         "duckduckgo-search>=6.0.0",
